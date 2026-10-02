@@ -2,7 +2,7 @@
  * Hunter Adams (vha3@cornell.edu)
  *
  * This demonstration drops multiple balls through a 16-row Galton board.
- * Through a serial interface, the user can change the ball color.
+ * The rotary encoder controls the number of animated balls.
  *
  * HARDWARE CONNECTIONS
   - GPIO 16 ---> VGA Hsync
@@ -30,7 +30,6 @@
 #include <limits.h>
 // Include Pico libraries
 #include "pico/stdlib.h"
-#include "pico/divider.h"
 #include "pico/multicore.h"
 #include "pico/sync.h"
 // Include hardware libraries
@@ -46,9 +45,6 @@
 
 // Number of samples per period in sine table
 #define sine_table_size 256
-
-// Sine table
-int raw_sin[sine_table_size];
 
 // Table of values to be sent to DAC
 unsigned short DAC_data[sine_table_size];
@@ -79,15 +75,6 @@ static uint32_t peg_sound_events = 0; // how many collisions have happened
 // rotary encoder GPIOs (C_PIN is connected to GND pin 18)
 #define A_PIN 13
 #define B_PIN 14
-
-// define states for the rotary encoder
-typedef enum
-{
-    CW,
-    CCW,
-    STOPPED
-} rotary_dir_t;
-static volatile rotary_dir_t rotary_dir_state = STOPPED; // and initialize state variable
 
 static volatile int rotary_count = 0; // Requested active balls; never negative.
 
@@ -127,49 +114,8 @@ static PT_THREAD(protothread_sound(struct pt *pt))
 // ========================================
 // === BALLS AND PEGS !!!!
 // ========================================
-// the fixed point macros
-typedef signed int fix15;
-#define multfix15(a, b) ((fix15)((((signed long long)(a)) * ((signed long long)(b))) >> 15))
-#define float2fix15(a) ((fix15)((a) * 32768.0)) // 2^15
-#define fix2float15(a) ((float)(a) / 32768.0)
-#define absfix15(a) abs(a)
-#define int2fix15(a) ((fix15)(a << 15))
-#define fix2int15(a) ((int)(a >> 15))
-#define char2fix15(a) (fix15)(((fix15)(a)) << 15)
-#define divfix(a, b) (fix15)(div_s64s64((((signed long long)(a)) << 15), ((signed long long)(b))))
-
-// the color of the boid
-char color = WHITE;
-
-// Boid on core 0
-fix15 boid0_x;
-fix15 boid0_y;
-fix15 boid0_vx;
-fix15 boid0_vy;
-
-// Boid on core 1
-fix15 boid1_x;
-fix15 boid1_y;
-fix15 boid1_vx;
-fix15 boid1_vy;
-
-// Create a semaphore
-semaphore_t draw_semaphore;
-
-// Create a boid
-void spawnBoid(fix15 *x, fix15 *y, fix15 *vx, fix15 *vy, int direction)
-{
-    // Start in the top center of screen
-    *x = int2fix15(320);
-    *y = int2fix15(0);
-    // Choose left or right ...
-    if (direction)
-        *vx = int2fix15(3);
-    else
-        *vx = int2fix15(-3);
-    // Moving down
-    *vy = int2fix15(1);
-}
+// Ball color.
+static const char color = WHITE;
 
 // global variables for balls and pegs. positions are pixels; velocities are pixels/frame.
 #define BALL_RADIUS 4
@@ -351,56 +297,18 @@ static PT_THREAD(protothread_anim(struct pt *pt))
     PT_END(pt);
 } // animation thread
 
-// Animation on core 1
-static PT_THREAD(protothread_anim1(struct pt *pt))
-{
-    // Mark beginning of thread
-    PT_BEGIN(pt);
-
-    // Spawn a boid
-    spawnBoid(&boid1_x, &boid1_y, &boid1_vx, &boid1_vy, 1);
-
-    while (1)
-    {
-        // Wait for the signal from core 0
-        PT_SEM_SDK_WAIT(pt, &draw_semaphore);
-        // Update position without wall collisions (inactive original demo).
-        boid1_x += boid1_vx;
-        boid1_y += boid1_vy;
-        // draw the boid at its new position
-        fillCircle(fix2int15(boid1_x), fix2int15(boid1_y), 15, color);
-        // NEVER exit while
-    } // END WHILE(1)
-    PT_END(pt);
-} // animation thread
-
-// ========================================
-// === core 1 main -- started in main below
-// ========================================
-void core1_main()
-{
-    // Add animation thread
-    pt_add_thread(protothread_anim1);
-    // Start the scheduler
-    pt_schedule_start;
-}
-
 // ========================================
 // === main
 // ========================================
 // USE ONLY C-sdk library
 int main()
 {
-    set_sys_clock_khz(150000, true);
+    set_sys_clock_khz(300000, true);
     // initialize stio
     stdio_init_all();
 
     // initialize VGA
     initVGA();
-
-    // Initialize the semaphore
-    // Arguments: pointer to sem, initial count, max count
-    sem_init(&draw_semaphore, 0, 1);
 
     // configure GPIOs and enable pullups
     gpio_init(A_PIN);
@@ -488,7 +396,7 @@ int main()
     );
     // The sound thread starts DMA only when a peg impact is queued.
 
-    // One ball is drawn on core 0; leave the original core 1 demo inactive.
+    // Randomize the initial horizontal velocity of each ball.
     srand(time_us_32());
 
     // add threads
