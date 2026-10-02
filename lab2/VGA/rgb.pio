@@ -8,8 +8,8 @@
 ; define the pixel hold times which depend on clock freq
 ; pixel1hold should be 5 for 150 MHz  (4 for 125 MHz)
 ; pixel2hold should be 3 for 150 MHz  (2 for 125 MHz)
-.define pixel1hold 5
-.define pixel2hold 3
+.define pixel1hold 11
+.define pixel2hold 9
 .define PUBLIC vid_freq 150
 
 pull block 					; Pull from FIFO to OSR (only once)
