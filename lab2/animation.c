@@ -2,7 +2,7 @@
  * Hunter Adams (vha3@cornell.edu)
  *
  * This demonstration drops multiple balls through a 16-row Galton board.
- * Through a serial interface, the user can change the ball color.
+ * The rotary encoder controls the number of animated balls.
  *
  * HARDWARE CONNECTIONS
   - GPIO 16 ---> VGA Hsync
@@ -30,7 +30,6 @@
 #include <limits.h>
 // Include Pico libraries
 #include "pico/stdlib.h"
-#include "pico/divider.h"
 #include "pico/multicore.h"
 #include "pico/sync.h"
 // Include hardware libraries
@@ -46,9 +45,6 @@
 
 // Number of samples per period in sine table
 #define sine_table_size 256
-
-// Sine table
-int raw_sin[sine_table_size];
 
 // Table of values to be sent to DAC
 unsigned short DAC_data[sine_table_size];
@@ -79,15 +75,6 @@ static uint32_t peg_sound_events = 0; // how many collisions have happened
 // rotary encoder GPIOs (C_PIN is connected to GND pin 18)
 #define A_PIN 13
 #define B_PIN 14
-
-// define states for the rotary encoder
-typedef enum
-{
-    CW,
-    CCW,
-    STOPPED
-} rotary_dir_t;
-static volatile rotary_dir_t rotary_dir_state = STOPPED; // and initialize state variable
 
 static volatile int rotary_count = 0; // Requested active balls; never negative.
 
@@ -381,7 +368,7 @@ static PT_THREAD(protothread_anim(struct pt *pt))
 // USE ONLY C-sdk library
 int main()
 {
-    set_sys_clock_khz(150000, true);
+    set_sys_clock_khz(300000, true);
     // initialize stio
     stdio_init_all();
 
@@ -474,7 +461,7 @@ int main()
     );
     // The sound thread starts DMA only when a peg impact is queued.
 
-    // One ball is drawn on core 0; leave the original core 1 demo inactive.
+    // Randomize the initial horizontal velocity of each ball.
     srand(time_us_32());
 
     // add threads
