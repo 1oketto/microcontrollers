@@ -137,7 +137,7 @@ typedef signed int fix15;
 #define PEG_X int2fix15(320)
 #define PEG_Y int2fix15(60)
 #define GRAVITY ((fix15)12124) // 0.37 in Q15
-#define BOUNCINESS ((fix15)16384) // 0.5 in Q15
+#define BOUNCINESS ((fix15)12124) // 0.37 in Q15
 
 static fix15 peg_x[PEG_COUNT], peg_y[PEG_COUNT];
 
@@ -160,7 +160,7 @@ static void initPegs(void)
 static void drawPegs(void)
 {
     for (int peg = 0; peg < PEG_COUNT; ++peg)
-        fillCircle((short)fix2int15(peg_x[peg]), (short)fix2int15(peg_y[peg]), PEG_RADIUS, WHITE);
+        drawCircle((short)fix2int15(peg_x[peg]), (short)fix2int15(peg_y[peg]), PEG_RADIUS, WHITE);
 }
 
 // boid
@@ -358,7 +358,7 @@ static PT_THREAD(protothread_anim(struct pt *pt))
             // Avoid drawing off-screen coordinates while a boid falls past the sides.
             if (boids[i].x >= -int2fix15(boid_RADIUS) && boids[i].x <= int2fix15(640 + boid_RADIUS) &&
                 boids[i].y >= -int2fix15(boid_RADIUS) && boids[i].y <= int2fix15(480 + boid_RADIUS))
-                fillCircle((short)fix2int15(boids[i].x), (short)fix2int15(boids[i].y), boid_RADIUS, color);
+                drawCircle((short)fix2int15(boids[i].x), (short)fix2int15(boids[i].y), boid_RADIUS, color);
         }
         drawStats();
         drawHistogram();
