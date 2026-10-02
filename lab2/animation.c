@@ -1,8 +1,8 @@
 /**
  * Hunter Adams (vha3@cornell.edu)
  *
- * This demonstration drops multiple balls through a 16-row Galton board.
- * The rotary encoder controls the number of animated balls.
+ * This demonstration drops multiple boids through a 16-row Galton board.
+ * The rotary encoder controls the number of animated boids.
  *
  * HARDWARE CONNECTIONS
   - GPIO 16 ---> VGA Hsync
@@ -66,7 +66,7 @@ const uint32_t transfer_count = sine_table_size;
 
 static int data_chan;
 static int ctrl_chan;
-// Ball collisions produce events; the sound thread consumes them.
+// boid collisions produce events; the sound thread consumes them.
 static uint32_t peg_sound_events = 0; // how many collisions have happened
 // played_peg_events = how many collisions have happened
 // ^^ together they keep track of whether sound has been played for a collision
@@ -76,7 +76,7 @@ static uint32_t peg_sound_events = 0; // how many collisions have happened
 #define A_PIN 13
 #define B_PIN 14
 
-static volatile int rotary_count = 0; // Requested active balls; never negative.
+static volatile int rotary_count = 0; // Requested active boids; never negative.
 
 // GPIO ISR: CW is A falls while B is high
 void gpio_callback(uint gpio, uint32_t events)
@@ -89,7 +89,7 @@ void gpio_callback(uint gpio, uint32_t events)
     }
 }
 
-// play a DMA sound for each ball-peg collision
+// play a DMA sound for each boid-peg collision
 static PT_THREAD(protothread_sound(struct pt *pt))
 {
     static uint32_t played_peg_events = 0; // how many collision sounds we've already played
@@ -112,33 +112,46 @@ static PT_THREAD(protothread_sound(struct pt *pt))
 }
 
 // ========================================
-// === BALLS AND PEGS !!!!
+// === boidS AND PEGS !!!!
 // ========================================
-// Ball color.
 static const char color = WHITE;
 
-// global variables for balls and pegs. positions are pixels; velocities are pixels/frame.
-#define BALL_RADIUS 4
+typedef signed int fix15;
+#define multfix15(a, b) ((fix15)(((int64_t)(a) * (int64_t)(b)) / 32768)) // symmetric rounding toward zero
+#define float2fix15(a) ((fix15)((a) * 32768.0)) // 2^15
+#define fix2float15(a) ((float)(a) / 32768.0)
+#define absfix15(a) abs(a)
+#define int2fix15(a) ((fix15)((a) * 32768))
+#define fix2int15(a) ((int)(a >> 15))
+#define char2fix15(a) (fix15)(((fix15)(a)) << 15)
+#define divfix(a, b) ((fix15)(((int64_t)(a) * 32768) / (int64_t)(b)))
+
+// global variables for boids and pegs. positions are pixels; velocities are pixels/frame.
+#define boid_RADIUS 4
 #define PEG_RADIUS 6
 #define PEG_ROWS 16
 #define PEG_COUNT (PEG_ROWS * (PEG_ROWS + 1) / 2)
 // Center-to-center spacing between pegs and rows.
 #define PEG_HORIZONTAL_SPACING 38
 #define PEG_VERTICAL_SPACING 19
-#define PEG_X 320.0f
-#define PEG_Y 60.0f
-#define GRAVITY 0.37f
-#define BOUNCINESS 0.5f
+#define PEG_X int2fix15(320)
+#define PEG_Y int2fix15(60)
+#define GRAVITY ((fix15)12124) // 0.37 in Q15
+#define BOUNCINESS ((fix15)16384) // 0.5 in Q15
 
-static float peg_x[PEG_COUNT], peg_y[PEG_COUNT];
+static fix15 peg_x[PEG_COUNT], peg_y[PEG_COUNT];
+
+// Histogram parameters and variables
+#define HISTOGRAM_BINS (PEG_ROWS - 1) // one bin for each gap between adjacent pegs in the bottom row
+static int histogram[HISTOGRAM_BINS] = {0}; // tracks num of boids fallen in each bin
 
 static void initPegs(void)
 {
     int peg = 0;
     for (int row = 0; row < PEG_ROWS; ++row) {
         for (int col = 0; col <= row; ++col) {
-            peg_x[peg] = PEG_X + (col - row * 0.5f) * PEG_HORIZONTAL_SPACING;
-            peg_y[peg] = PEG_Y + row * PEG_VERTICAL_SPACING;
+            peg_x[peg] = PEG_X + (2 * col - row) * int2fix15(PEG_HORIZONTAL_SPACING) / 2;
+            peg_y[peg] = PEG_Y + int2fix15(row * PEG_VERTICAL_SPACING);
             ++peg;
         }
     }
@@ -147,124 +160,180 @@ static void initPegs(void)
 static void drawPegs(void)
 {
     for (int peg = 0; peg < PEG_COUNT; ++peg)
-        fillCircle((short)peg_x[peg], (short)peg_y[peg], PEG_RADIUS, WHITE);
+        fillCircle((short)fix2int15(peg_x[peg]), (short)fix2int15(peg_y[peg]), PEG_RADIUS, WHITE);
 }
 
-// ball
+// boid
 typedef struct {
-    float x, y;
-    float vx, vy;
+    fix15 x, y;
+    fix15 vx, vy;
     int last_peg;
-} Ball;
+    bool histogram_recorded;
+} boid;
 
-static Ball *balls = NULL;
-static int ball_count = 0;
-static int ball_capacity = 0;
+static boid *boids = NULL;
+static int boid_count = 0;
+static int boid_capacity = 0;
 static uint64_t total_fallen = 0;
 
-static void dropBall(Ball *ball)
+static void dropboid(boid *boid)
 {
-    ball->x = PEG_X;
-    ball->y = BALL_RADIUS;
-    // Small nonzero horizontal speed, randomized to either side.
-    ball->vx = (float)(1 + rand() % 12) * 0.01f;
+    boid->x = PEG_X;
+    boid->y = int2fix15(boid_RADIUS);
+    // Use fine Q15 increments (~0.01 to 0.12 pixels/frame). Twelve
+    // discrete speeds repeat the same paths and leave holes in the histogram.
+    boid->vx = (fix15)(328 + rand() % 3605);
     if (rand() % 2)
-        ball->vx = -ball->vx;
-    ball->vy = 0.0f;
-    ball->last_peg = -1;
+        boid->vx = -boid->vx;
+    boid->vy = 0;
+    boid->last_peg = -1;
+    boid->histogram_recorded = false;
 }
 
-// Allocate outside the ISR and preserve existing balls when the count changes.
-static void syncBallCount(void)
+// Allocate outside the ISR and preserve existing boids when the count changes.
+static void syncboidCount(void)
 {
     int requested = rotary_count;
-    if (requested > ball_capacity) {
-        Ball *resized = NULL;
-        if ((size_t)requested <= SIZE_MAX / sizeof(*balls))
-            resized = realloc(balls, (size_t)requested * sizeof(*balls));
+    if (requested > boid_capacity) {
+        boid *resized = NULL;
+        if ((size_t)requested <= SIZE_MAX / sizeof(*boids))
+            resized = realloc(boids, (size_t)requested * sizeof(*boids));
         if (resized == NULL) {
             // Keep the displayed and requested counts consistent if memory is full.
             uint32_t irq_state = save_and_disable_interrupts();
-            if (rotary_count == requested) rotary_count = ball_count;
+            if (rotary_count == requested) rotary_count = boid_count;
             restore_interrupts(irq_state);
             return;
         }
-        balls = resized;
-        ball_capacity = requested;
+        boids = resized;
+        boid_capacity = requested;
     }
-    for (int i = ball_count; i < requested; ++i)
-        dropBall(&balls[i]);
-    ball_count = requested;
+    for (int i = boid_count; i < requested; ++i)
+        dropboid(&boids[i]);
+    boid_count = requested;
 }
 
-static void updateBall(Ball *ball)
+// Integer square root of a Q30 squared distance returns a Q15 distance.
+static fix15 distanceFix15(fix15 dx, fix15 dy)
 {
-    ball->x += ball->vx;
-    ball->y += ball->vy;
+    uint64_t remainder = (uint64_t)((int64_t)dx * dx) +
+                         (uint64_t)((int64_t)dy * dy);
+    uint64_t root = 0;
+    uint64_t bit = (uint64_t)1 << 62;
+    while (bit > remainder) bit >>= 2;
+    while (bit != 0) {
+        if (remainder >= root + bit) {
+            remainder -= root + bit;
+            root = (root >> 1) + bit;
+        } else {
+            root >>= 1;
+        }
+        bit >>= 2;
+    }
+    return (fix15)root;
+}
+
+static void updateboid(boid *boid)
+{
+    boid->x += boid->vx;
+    boid->y += boid->vy;
 
     for (int peg = 0; peg < PEG_COUNT; ++peg) {
-        float dx = ball->x - peg_x[peg];
-        float dy = ball->y - peg_y[peg];
-        float collision_distance = BALL_RADIUS + PEG_RADIUS;
-        if (fabsf(dx) < collision_distance && fabsf(dy) < collision_distance)
+        fix15 dx = boid->x - peg_x[peg];
+        fix15 dy = boid->y - peg_y[peg];
+        fix15 collision_distance = int2fix15(boid_RADIUS + PEG_RADIUS);
+        if (absfix15(dx) < collision_distance && absfix15(dy) < collision_distance)
         {
-            float distance = sqrtf(dx * dx + dy * dy);
+            fix15 distance = distanceFix15(dx, dy);
             if (distance < collision_distance)
             {
                 // If centers coincide, choose an upward normal to avoid dividing by zero.
-                float normal_x = distance > 0.0001f ? dx / distance : 0.0f;
-                float normal_y = distance > 0.0001f ? dy / distance : -1.0f;
-                float dot = normal_x * ball->vx + normal_y * ball->vy;
-                ball->x = peg_x[peg] + normal_x * (collision_distance + 1.0f);
-                ball->y = peg_y[peg] + normal_y * (collision_distance + 1.0f);
+                fix15 normal_x = distance > 0 ? divfix(dx, distance) : 0;
+                fix15 normal_y = distance > 0 ? divfix(dy, distance) : -int2fix15(1);
+                fix15 dot = multfix15(normal_x, boid->vx) + multfix15(normal_y, boid->vy);
+                boid->x = peg_x[peg] + multfix15(normal_x, collision_distance + int2fix15(1));
+                boid->y = peg_y[peg] + multfix15(normal_y, collision_distance + int2fix15(1));
                 // Only reflect when moving toward the peg, not away from it.
-                if (dot < 0.0f)
+                if (dot < 0)
                 {
-                    float intermediate_term = -2.0f * dot;
-                    ball->vx += normal_x * intermediate_term;
-                    ball->vy += normal_y * intermediate_term;
-                    // Sound and damping only when this ball hits a different peg.
-                    if (ball->last_peg != peg)
+                    fix15 intermediate_term = -2 * dot;
+                    boid->vx += multfix15(normal_x, intermediate_term);
+                    boid->vy += multfix15(normal_y, intermediate_term);
+                    // Sound and damping only when this boid hits a different peg.
+                    if (boid->last_peg != peg)
                     {
                         ++peg_sound_events;
-                        ball->vx *= BOUNCINESS;
-                        ball->vy *= BOUNCINESS;
-                        ball->last_peg = peg;
+                        boid->vx = multfix15(boid->vx, BOUNCINESS);
+                        boid->vy = multfix15(boid->vy, BOUNCINESS);
+                        boid->last_peg = peg;
                     }
                 }
             }
         }
     }
 
-    // Respawn this ball after it falls completely below the screen.
-    if (ball->y > 480 + BALL_RADIUS)
+    // Record the gap as soon as the boid clears the bottom row.
+    // Waiting until the screen edge lets horizontal drift change the bin.
+    const fix15 bottom_row_y = PEG_Y + int2fix15((PEG_ROWS - 1) * PEG_VERTICAL_SPACING);
+    if (!boid->histogram_recorded &&
+        boid->y > bottom_row_y + int2fix15(PEG_RADIUS + boid_RADIUS))
+    {
+        const fix15 first_peg_x =
+            PEG_X - int2fix15((PEG_ROWS - 1) * PEG_HORIZONTAL_SPACING) / 2;
+        // Reject positions left of the board before integer division.
+        fix15 offset = boid->x - first_peg_x;
+        int bin = offset < 0 ? -1 : offset / int2fix15(PEG_HORIZONTAL_SPACING);
+        if (bin >= 0 && bin < HISTOGRAM_BINS)
+            histogram[bin]++;
+        boid->histogram_recorded = true;
+    }
+
+    // Respawn this boid after it falls completely below the screen.
+    if (boid->y > int2fix15(480 + boid_RADIUS))
     {
         ++total_fallen;
-        dropBall(ball);
-        return; // Keep the new drop's initial y-velocity at zero.
+
+        dropboid(boid);
+        return; // reset the new drop's initial y-velocity to zero
     }
-    ball->vy += GRAVITY;
+    boid->vy += GRAVITY; // add
 }
 
-// draw the stats: # balls being animated, total # of balls fallen since reset, and time since boot
+// draw the stats: # boids being animated, total # of boids fallen since reset, and time since boot
 static void drawStats(void)
 {
     char text[80];
     uint64_t seconds = time_us_64() / 1000000u;
     setTextSize(2);
     setTextColor(WHITE);
-    setCursor(10, 400);
-    snprintf(text, sizeof(text), "Balls being animated: %d", ball_count);
+    setCursor(10, 5);
+    snprintf(text, sizeof(text), "boids being animated: %d", boid_count);
     writeString(text);
-    setCursor(10, 420);
+    setCursor(10, 22);
     snprintf(text, sizeof(text), "Total fallen since reset: %llu",
              (unsigned long long)total_fallen);
     writeString(text);
-    setCursor(10, 440);
+    setCursor(10, 39);
     snprintf(text, sizeof(text), "Time since boot: %llu:%02u:%02u",
              (unsigned long long)(seconds / 3600),
              (unsigned)((seconds / 60) % 60), (unsigned)(seconds % 60));
     writeString(text);
+}
+
+// Bars align with the fifteen gaps in the bottom peg row.
+static void drawHistogram(void)
+{
+    const int height = 110;
+    int max_count = 0;
+    for (int i = 0; i < HISTOGRAM_BINS; ++i)
+        if (histogram[i] > max_count) max_count = histogram[i];
+    if (max_count == 0) return;
+    for (int i = 0; i < HISTOGRAM_BINS; ++i) {
+        int bar_height = (int)((int64_t)histogram[i] * height / max_count);
+        if (bar_height > 0)
+            fillRect(35 + i * PEG_HORIZONTAL_SPACING, 475 - bar_height,
+                     PEG_HORIZONTAL_SPACING - 1, bar_height, WHITE);
+    }
 }
 
 // Animation on core 0
@@ -273,28 +342,30 @@ static PT_THREAD(protothread_anim(struct pt *pt))
     // Mark beginning of thread
     PT_BEGIN(pt);
 
-    // Start with an empty board; the encoder adds and removes balls.
+    // Start with an empty board; the encoder adds and removes boids.
     initPegs();
 
     while (1)
     {
         // Wait for the signal that the buffer's changed
         PT_YIELD_UNTIL(pt, draw_start_signal());
-        syncBallCount();
+        syncboidCount();
         // Clear the buffer
         clearLowFrame(0, BLACK);
         drawPegs();
-        for (int i = 0; i < ball_count; ++i) {
-            updateBall(&balls[i]);
-            // Avoid drawing off-screen coordinates while a ball falls past the sides.
-            if (balls[i].x >= -BALL_RADIUS && balls[i].x <= 640 + BALL_RADIUS &&
-                balls[i].y >= -BALL_RADIUS && balls[i].y <= 480 + BALL_RADIUS)
-                fillCircle((short)balls[i].x, (short)balls[i].y, BALL_RADIUS, color);
+        for (int i = 0; i < boid_count; ++i) {
+            updateboid(&boids[i]);
+            // Avoid drawing off-screen coordinates while a boid falls past the sides.
+            if (boids[i].x >= -int2fix15(boid_RADIUS) && boids[i].x <= int2fix15(640 + boid_RADIUS) &&
+                boids[i].y >= -int2fix15(boid_RADIUS) && boids[i].y <= int2fix15(480 + boid_RADIUS))
+                fillCircle((short)fix2int15(boids[i].x), (short)fix2int15(boids[i].y), boid_RADIUS, color);
         }
         drawStats();
+        drawHistogram();
         // NEVER exit while
     } // END WHILE(1)
     PT_END(pt);
+
 } // animation thread
 
 // ========================================
@@ -330,8 +401,8 @@ int main()
     for (int i = 0; i < sine_table_size; i++) {
         float t = (float)i / 44000.0f; // 44,000 samples/s
         float thump =
-            2047 +                                      // midpoint or "zero"
-            1800 * expf(-1200.0f * t)          // amplitude * decay factor
+            2047 +                            // midpoint or "zero"
+            1800 * expf(-800.0f * t)          // amplitude * decay factor
                  * sinf(2.0f * 3.14159f * 150.0f * t);  // oscillation, 150Hz sine wave
         DAC_data[i] = DAC_config_chan_A | (((int)thump) & 0x0fff); // takes calculated 12b sample -> 16b for DAC
     }
@@ -396,7 +467,7 @@ int main()
     );
     // The sound thread starts DMA only when a peg impact is queued.
 
-    // Randomize the initial horizontal velocity of each ball.
+    // Randomize the initial horizontal velocity of each boid.
     srand(time_us_32());
 
     // add threads
