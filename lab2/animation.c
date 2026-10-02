@@ -94,11 +94,11 @@ static volatile int rotary_count = 0; // Requested active balls; never negative.
 // GPIO ISR: CW is A falls while B is high
 void gpio_callback(uint gpio, uint32_t events)
 {
-    if (gpio != A_PIN || !(events & GPIO_IRQ_EDGE_FALL)) return;
+    if (gpio != A_PIN || !(events & GPIO_IRQ_EDGE_FALL)) return; // in case gpio_callback is used for multiple GPIOs/events
     if (gpio_get(B_PIN)) {
-        if (rotary_count < INT_MAX) ++rotary_count;
-    } else if (rotary_count > 0) {
-        --rotary_count;
+        if (rotary_count < INT_MAX) ++rotary_count; // CW, increment
+    } else {
+        if (rotary_count > 0) --rotary_count; // CCW, decrement
     }
 }
 
@@ -138,38 +138,8 @@ typedef signed int fix15;
 #define char2fix15(a) (fix15)(((fix15)(a)) << 15)
 #define divfix(a, b) (fix15)(div_s64s64((((signed long long)(a)) << 15), ((signed long long)(b))))
 
-// the color of the boid
+// the color of the ball
 char color = WHITE;
-
-// Boid on core 0
-fix15 boid0_x;
-fix15 boid0_y;
-fix15 boid0_vx;
-fix15 boid0_vy;
-
-// Boid on core 1
-fix15 boid1_x;
-fix15 boid1_y;
-fix15 boid1_vx;
-fix15 boid1_vy;
-
-// Create a semaphore
-semaphore_t draw_semaphore;
-
-// Create a boid
-void spawnBoid(fix15 *x, fix15 *y, fix15 *vx, fix15 *vy, int direction)
-{
-    // Start in the top center of screen
-    *x = int2fix15(320);
-    *y = int2fix15(0);
-    // Choose left or right ...
-    if (direction)
-        *vx = int2fix15(3);
-    else
-        *vx = int2fix15(-3);
-    // Moving down
-    *vy = int2fix15(1);
-}
 
 // global variables for balls and pegs. positions are pixels; velocities are pixels/frame.
 #define BALL_RADIUS 4
@@ -185,6 +155,10 @@ void spawnBoid(fix15 *x, fix15 *y, fix15 *vx, fix15 *vy, int direction)
 #define BOUNCINESS 0.5f
 
 static float peg_x[PEG_COUNT], peg_y[PEG_COUNT];
+
+// Histogram parameters and variables
+#define HISTOGRAM_BINS (PEG_ROWS - 1) // one bin for each gap between adjacent pegs in the bottom row
+static int histogram[HISTOGRAM_BINS] = {0}; // tracks num of balls fallen in each bin
 
 static void initPegs(void)
 {
@@ -233,22 +207,22 @@ static void syncBallCount(void)
 {
     int requested = rotary_count;
     if (requested > ball_capacity) {
-        Ball *resized = NULL;
+        Ball *resized = NULL; // Holds memory to store data of all Ball struct instances
         if ((size_t)requested <= SIZE_MAX / sizeof(*balls))
             resized = realloc(balls, (size_t)requested * sizeof(*balls));
-        if (resized == NULL) {
-            // Keep the displayed and requested counts consistent if memory is full.
+        if (resized == NULL) { // If requested num Ball struct instances is more than memory can store
+            // Keep the displayed and requested counts 
             uint32_t irq_state = save_and_disable_interrupts();
-            if (rotary_count == requested) rotary_count = ball_count;
+            if (rotary_count == requested) rotary_count = ball_count; 
             restore_interrupts(irq_state);
-            return;
+            return; // exit syncBallCount() before normal update instructions
         }
         balls = resized;
         ball_capacity = requested;
     }
     for (int i = ball_count; i < requested; ++i)
         dropBall(&balls[i]);
-    ball_count = requested;
+    ball_count = requested; // stores ball count in previous frame
 }
 
 static void updateBall(Ball *ball)
@@ -293,11 +267,19 @@ static void updateBall(Ball *ball)
     // Respawn this ball after it falls completely below the screen.
     if (ball->y > 480 + BALL_RADIUS)
     {
+        // Determine which bottom-row gap the ball fell through
+        float first_peg_x =
+            PEG_X - ((PEG_ROWS - 1) * 0.5f) * PEG_HORIZONTAL_SPACING;
+        int bin = (int)((ball->x - first_peg_x) / PEG_HORIZONTAL_SPACING); // map to corresponding bin
+        if (bin >= 0 && bin < HISTOGRAM_BINS) // increment tracker to update in histogram
+            histogram[bin]++;
+
         ++total_fallen;
+
         dropBall(ball);
-        return; // Keep the new drop's initial y-velocity at zero.
+        return; // reset the new drop's initial y-velocity to zero
     }
-    ball->vy += GRAVITY;
+    ball->vy += GRAVITY; // add
 }
 
 // draw the stats: # balls being animated, total # of balls fallen since reset, and time since boot
@@ -307,18 +289,58 @@ static void drawStats(void)
     uint64_t seconds = time_us_64() / 1000000u;
     setTextSize(2);
     setTextColor(WHITE);
-    setCursor(10, 400);
-    snprintf(text, sizeof(text), "Balls being animated: %d", ball_count);
+    setCursor(10, 5);
+    snprintf(text, sizeof(text), "Num balls being animated: %d", ball_count);
     writeString(text);
-    setCursor(10, 420);
+    setCursor(10, 22);
     snprintf(text, sizeof(text), "Total fallen since reset: %llu",
              (unsigned long long)total_fallen);
     writeString(text);
-    setCursor(10, 440);
+    setCursor(10, 39);
     snprintf(text, sizeof(text), "Time since boot: %llu:%02u:%02u",
              (unsigned long long)(seconds / 3600),
-             (unsigned)((seconds / 60) % 60), (unsigned)(seconds % 60));
+             (unsigned)((seconds / 60) % 60),
+             (unsigned)(seconds % 60));
     writeString(text);
+}
+
+// draw the histogram: # balls that have fallen through each pair of pegs in the bottom row
+static void drawHistogram(void)
+{
+    const int HIST_X = 35;
+    const int HIST_Y = 365;
+    const int HIST_WIDTH = 570;
+    const int HIST_HEIGHT = 110;
+
+    const int BAR_WIDTH = HIST_WIDTH / HISTOGRAM_BINS;
+
+    // Find the largest bin
+    int max_count = 0;
+    for (int i = 0; i < HISTOGRAM_BINS; ++i) {
+        if (histogram[i] > max_count)
+            max_count = histogram[i];
+    }
+
+    // Draw each bar
+    for (int i = 0; i < HISTOGRAM_BINS; ++i) {
+
+        int bar_height = 0;
+
+        // Normalize bar height to available histogram space
+        if (max_count > 0)
+            bar_height = (histogram[i] * HIST_HEIGHT) / max_count;
+
+        int x = HIST_X + i * BAR_WIDTH;
+        int y = HIST_Y + HIST_HEIGHT - bar_height;
+
+        fillRect(
+            x,
+            y,
+            BAR_WIDTH - 1,
+            bar_height,
+            WHITE
+        );
+    }
 }
 
 // Animation on core 0
@@ -346,44 +368,12 @@ static PT_THREAD(protothread_anim(struct pt *pt))
                 fillCircle((short)balls[i].x, (short)balls[i].y, BALL_RADIUS, color);
         }
         drawStats();
+        drawHistogram();
         // NEVER exit while
     } // END WHILE(1)
     PT_END(pt);
 } // animation thread
 
-// Animation on core 1
-static PT_THREAD(protothread_anim1(struct pt *pt))
-{
-    // Mark beginning of thread
-    PT_BEGIN(pt);
-
-    // Spawn a boid
-    spawnBoid(&boid1_x, &boid1_y, &boid1_vx, &boid1_vy, 1);
-
-    while (1)
-    {
-        // Wait for the signal from core 0
-        PT_SEM_SDK_WAIT(pt, &draw_semaphore);
-        // Update position without wall collisions (inactive original demo).
-        boid1_x += boid1_vx;
-        boid1_y += boid1_vy;
-        // draw the boid at its new position
-        fillCircle(fix2int15(boid1_x), fix2int15(boid1_y), 15, color);
-        // NEVER exit while
-    } // END WHILE(1)
-    PT_END(pt);
-} // animation thread
-
-// ========================================
-// === core 1 main -- started in main below
-// ========================================
-void core1_main()
-{
-    // Add animation thread
-    pt_add_thread(protothread_anim1);
-    // Start the scheduler
-    pt_schedule_start;
-}
 
 // ========================================
 // === main
@@ -397,10 +387,6 @@ int main()
 
     // initialize VGA
     initVGA();
-
-    // Initialize the semaphore
-    // Arguments: pointer to sem, initial count, max count
-    sem_init(&draw_semaphore, 0, 1);
 
     // configure GPIOs and enable pullups
     gpio_init(A_PIN);
