@@ -71,11 +71,18 @@ typedef struct {
     uint32_t peg_sound_events;
     uint32_t total_fallen;
     uint32_t histogram[HISTOGRAM_BINS];
+    uint32_t rng;                      // per-core generator state
 } core_stats;
+static core_stats stats0 = {.rng = 1};
+static core_stats stats1 = {.rng = 2};
+static uint32_t spawn_rng = 3;
 
-static core_stats stats0 = {0};
-static core_stats stats1 = {0};
-
+static uint32_t nextRandom(uint32_t *state)
+{
+    uint32_t v = *state;
+    v ^= v << 13; v ^= v >> 17; v ^= v << 5;
+    return *state = v;
+}
 
 // Number of DMA transfers per event
 const uint32_t transfer_count = sine_table_size;
@@ -84,6 +91,10 @@ static int data_chan;
 static int ctrl_chan;
 // boid collisions produce events; the sound thread consumes them.
 
+// 60 fps gives each animation frame 16,666 microseconds.
+#define FRAME_BUDGET_US (1000000u / 60u)
+#define DEADLINE_LED_PIN PICO_DEFAULT_LED_PIN
+
 // played_peg_events = how many collisions have happened
 // ^^ together they keep track of whether sound has been played for a collision
 // and collisions aren't lost while DMA is busy
@@ -91,11 +102,24 @@ static int ctrl_chan;
 // rotary encoder GPIOs (C_PIN is connected to GND pin 18)
 #define A_PIN 13
 #define B_PIN 14
-#define BOUNCE_PIN_OUT 15
-#define BOUNCE_PIN_IN 12
+#define BOUNCE_PIN_OUT 12
+#define BOUNCE_PIN_IN 15
 
 static volatile int rotary_count = 0; // Requested active boids; never negative.
-static volatile int current_bounciness = 37;
+
+//// NEW : USE BIT SHIFTS INSTEAD OF FLOATING PT DIVISION OR MULTIPLICATION
+// Bounciness levels: 0 (Off), 1 (1/16th), 2 (1/8th), 3 (1/4th), 4 (1/2), 5 (Full/1)
+#define BOUNCE_LEVEL_MAX 5
+#define BOUNCE_OFF_SHIFT 31u // Special shift amount to completely absorb velocity
+
+static volatile int bounciness_level = 3; // Default to 1/4th bounce
+
+// Convert a level (0-5) into a bit-shift count (or off state)
+static inline unsigned getBouncinessShift(int level) {
+    if (level <= 0) return BOUNCE_OFF_SHIFT;
+    return (unsigned)(BOUNCE_LEVEL_MAX - level); // e.g., level 4 -> shift by 1 (divide by 2)
+}
+////
 
 #define NUM_BALL_MODE 0
 #define BOUNCY_MODE 1
@@ -112,14 +136,15 @@ static int count_core0 = 0;
 
 // GPIO ISR: CW is A falls while B is high
 
+static volatile bool stats_reset_pending = false;
 void gpio_core0_callback(uint gpio, uint32_t events)
 {
-    total_fallen = 0;
     if (gpio != A_PIN || !(events & GPIO_IRQ_EDGE_FALL)) return;
-    
+    stats_reset_pending = true;
+
     if (rotary_mode == NUM_BALL_MODE) {
         if (gpio_get(B_PIN)) {
-            if (rotary_count < INT_MAX)
+            if (rotary_count < MAX_BALLS)
                 ++rotary_count;
         } else if (rotary_count > 0) {
             --rotary_count;
@@ -127,10 +152,10 @@ void gpio_core0_callback(uint gpio, uint32_t events)
     }
     else {  // BOUNCY_MODE
         if (gpio_get(B_PIN)) {
-            if (current_bounciness < 100)
-                ++current_bounciness;
-        } else if (current_bounciness > 0) {
-            --current_bounciness;
+            if (bounciness_level < BOUNCE_LEVEL_MAX)
+                ++bounciness_level;
+        } else if (bounciness_level > 0) {
+            --bounciness_level;
         }
     }
 }
@@ -140,9 +165,8 @@ static volatile uint64_t last_button_time = 0;
 
 void gpio_core1_callback(uint gpio, uint32_t events)
 {
-    total_fallen = 0;
-    if (gpio != BOUNCE_PIN_IN || !(events & GPIO_IRQ_EDGE_FALL))
-        return;
+    if (gpio != BOUNCE_PIN_IN || !(events & GPIO_IRQ_EDGE_FALL)) return;
+    stats_reset_pending = true;
 
     uint64_t now = time_us_64();
 
@@ -190,7 +214,7 @@ typedef signed int fix15;
 #define divfix(a, b) ((fix15)(((int64_t)(a) * 32768) / (int64_t)(b)))
 
 // global variables for boids and pegs. positions are pixels; velocities are pixels/frame.
-#define boid_RADIUS 4
+#define boid_RADIUS 1
 #define PEG_RADIUS 6
 // PEG_ROWS defined earlier
 // #define PEG_ROWS 16
@@ -263,72 +287,129 @@ static void drawPegs(void)
 }
 
 // boid
+// CHANGED: float --> int16_t; drops the struct size from 24 bytes down to 10 bytes
 typedef struct {
-    fix15 x, y;
-    fix15 vx, vy;
-    int last_peg;
+    int16_t x, y;     // Packed pixel coordinates
+    int16_t vx, vy;   // Packed velocity vectors
+    uint8_t last_peg;
     bool histogram_recorded;
 } boid;
 
-static boid *boids = NULL;
-static int boid_count = 0;
-static int boid_capacity = 0;
-
-static void dropboid(boid *boid)
+static inline int16_t packFixed(fix15 value, unsigned shift) // HELPS WITH CONVERTING TO int16_t FORMAT
 {
-    boid->x = PEG_X;
-    boid->y = int2fix15(boid_RADIUS);
-    // Use fine Q15 increments (~0.01 to 0.12 pixels/frame). Twelve
-    // discrete speeds repeat the same paths and leave holes in the histogram.
-    boid->vx = (fix15)(328 + rand() % 3605);
-    if (rand() % 2)
-        boid->vx = -boid->vx;
-    boid->vy = 0;
-    boid->last_peg = -1;
-    boid->histogram_recorded = false;
+    int32_t packed = (value + (1 << (shift - 1))) >> shift;
+    if (packed > INT16_MAX) packed = INT16_MAX;
+    if (packed < INT16_MIN) packed = INT16_MIN;
+    return (int16_t)packed;
 }
 
-// Allocate outside the ISR and preserve existing boids when the count changes.
+//_Static_assert(sizeof(boid) * MAX_BALLS < 100 * 1024, "ball pool too big");
+#define MAX_BALLS 20000
+static boid boids[MAX_BALLS];
+static int boid_count = 0;
+// static int boid_capacity = 0;
+
+static void dropboid(boid *b, uint32_t *rng)
+{
+    b->x = packFixed(PEG_X, 10);
+    b->y = boid_RADIUS * 32;
+    fix15 vx = (fix15)(328 + nextRandom(rng) % 3605);
+    if (nextRandom(rng) & 1u) vx = -vx;
+    b->vx = packFixed(vx, 5);
+    b->vy = 0;
+    b->last_peg = -1;
+    b->histogram_recorded = false;
+}
+
+// The fixed pool removes reallocations, heap fragmentation and worker hazards.
 static void syncboidCount(void)
 {
     int requested = rotary_count;
-    if (requested > boid_capacity) {
-        boid *resized = NULL;
-        if ((size_t)requested <= SIZE_MAX / sizeof(*boids))
-            resized = realloc(boids, (size_t)requested * sizeof(*boids));
-        if (resized == NULL) {
-            // Keep the displayed and requested counts consistent if memory is full.
-            uint32_t irq_state = save_and_disable_interrupts();
-            if (rotary_count == requested) rotary_count = boid_count;
-            restore_interrupts(irq_state);
-            return;
-        }
-        boids = resized;
-        boid_capacity = requested;
-    }
+    if (requested > MAX_BALLS) requested = MAX_BALLS;
+    if (requested < 0) requested = 0;
     for (int i = boid_count; i < requested; ++i)
-        dropboid(&boids[i]);
+        dropboid(&boids[i], &spawn_rng);
     boid_count = requested;
 }
 
-// Integer square root of a Q30 squared distance returns a Q15 distance.
-static fix15 distanceFix15(fix15 dx, fix15 dy)
+// // Integer square root of a Q30 squared distance returns a Q15 distance.
+// static fix15 distanceFix15(fix15 dx, fix15 dy)
+// {
+//     uint64_t remainder = (uint64_t)((int64_t)dx * dx) +
+//                          (uint64_t)((int64_t)dy * dy);
+//     uint64_t root = 0;
+//     uint64_t bit = (uint64_t)1 << 62;
+//     while (bit > remainder) bit >>= 2;
+//     while (bit != 0) {
+//         if (remainder >= root + bit) {
+//             remainder -= root + bit;
+//             root = (root >> 1) + bit;
+//         } else {
+//             root >>= 1;
+//         }
+//         bit >>= 2;
+//     }
+//     return (fix15)root;
+// }
+
+// NEW: fast inverse square root (trying in place of 1/sqrtf)
+static inline float fastInvSqrt(float x)
 {
-    uint64_t remainder = (uint64_t)((int64_t)dx * dx) +
-                         (uint64_t)((int64_t)dy * dy);
-    uint64_t root = 0;
-    uint64_t bit = (uint64_t)1 << 62;
-    while (bit > remainder) bit >>= 2;
-    while (bit != 0) {
-        if (remainder >= root + bit) {
-            remainder -= root + bit;
-            root = (root >> 1) + bit;
-        } else {
-            root >>= 1;
-        }
-        bit >>= 2;
+    float y = x;
+    uint32_t i;
+    memcpy(&i, &y, sizeof i);
+    i = 0x5f3759df - (i >> 1);
+    memcpy(&y, &i, sizeof y);
+    return y * (1.5f - 0.5f * x * y * y);   // one Newton step
+}
+
+static inline fix15 dampVelocity(fix15 velocity, unsigned shift) {
+    if (shift == BOUNCE_OFF_SHIFT) return 0; // Completely stop velocity if bounciness is 0
+    return velocity >> shift;                // Fast 1-cycle right bit-shift
+}
+
+//PUT COLLISION BODY MATH INTO HELPER FUNCTION
+#define FAST_PEG_MAX_BOUNCE 3   // level 3 = 1/4 (25%) bounciness
+
+static inline void collidePeg(boid *b, int peg, core_stats *stats)
+{
+    fix15 dx = b->x - peg_x[peg];
+    fix15 dy = b->y - peg_y[peg];
+    fix15 cd = int2fix15(boid_RADIUS + PEG_RADIUS);
+    if (absfix15(dx) >= cd || absfix15(dy) >= cd) return;
+
+    // CHANGED: distance check w/o using distanceFix15 and sqrt
+    int64_t d2 = (int64_t)dx * dx + (int64_t)dy * dy; // distance^2
+    if (d2 >= (int64_t)cd * cd) return;       // exact reject, no sqrt
+
+    fix15 normal_x, normal_y; // NEW: find without divfix
+    if (d2 == 0) {
+        normal_x = 0;
+        normal_y = -int2fix15(1); // coincident centers: push up
+    } else {
+        float fx = (float)dx, fy = (float)dy;
+        float inv = fastInvSqrt(fx * fx + fy * fy); // or just do 1.0f / sqrtf, might be faster?
+        normal_x = (fix15)(fx * inv * 32768.0f);
+        normal_y = (fix15)(fy * inv * 32768.0f);
     }
-    return (fix15)root;
+
+    fix15 dot = multfix15(normal_x, b->vx) + multfix15(normal_y, b->vy);
+    b->x = peg_x[peg] + multfix15(normal_x, cd + int2fix15(1));
+    b->y = peg_y[peg] + multfix15(normal_y, cd + int2fix15(1));
+    if (dot < 0) {
+        fix15 k = -2 * dot;
+        b->vx += multfix15(normal_x, k);
+        b->vy += multfix15(normal_y, k);
+        if (b->last_peg != peg) {
+            ++stats->peg_sound_events;
+            // NEW: (1-cycle bit shifts instead of fixed-pt division):
+            unsigned bounce_shift = getBouncinessShift(bounciness_level);
+            b->vx = dampVelocity(b->vx, bounce_shift);
+            b->vy = dampVelocity(b->vy, bounce_shift);
+
+            b->last_peg = peg;
+        }
+    }
 }
 
 static void updateboid(boid *boid, core_stats *stats)
@@ -336,52 +417,30 @@ static void updateboid(boid *boid, core_stats *stats)
     boid->x += boid->vx;
     boid->y += boid->vy;
 
-    int next_peg_arr[2] = {boid->last_peg, 0};
-    if (boid->last_peg < 120){ // assume in last row; no more collisions
-
-        if (boid->last_peg == -1) {
-            next_peg_arr[1] = 0;
+    if (bounciness_level <= FAST_PEG_MAX_BOUNCE) {
+        int lp = boid->last_peg;
+        if (lp == -1) {
+            collidePeg(boid, 0, stats);
+        } else if (lp < 120) {
+            int l = peg_left_child[lp], r = peg_right_child[lp];
+            collidePeg(boid, lp, stats);
+            collidePeg(boid, l, stats);
+            collidePeg(boid, r, stats);
+        } else {
+            collidePeg(boid, lp, stats);
         }
-        else if (boid->vx > 0)
-            next_peg_arr[1] = peg_right_child[boid->last_peg];
-        else
-            next_peg_arr[1] = peg_left_child[boid->last_peg];
 
-        for (int i = 0; i < sizeof(next_peg_arr) / sizeof(next_peg_arr[0]); ++i) {
-            fix15 dx = boid->x - peg_x[next_peg_arr[i]];
-            fix15 dy = boid->y - peg_y[next_peg_arr[i]];
-
-            fix15 collision_distance = int2fix15(boid_RADIUS + PEG_RADIUS);
-            if (absfix15(dx) < collision_distance && absfix15(dy) < collision_distance)
-            {
-                fix15 distance = distanceFix15(dx, dy);
-                if (distance < collision_distance)
-                {
-                    // If centers coincide, choose an upward normal to avoid dividing by zero.
-                    fix15 normal_x = distance > 0 ? divfix(dx, distance) : 0;
-                    fix15 normal_y = distance > 0 ? divfix(dy, distance) : -int2fix15(1);
-                    fix15 dot = multfix15(normal_x, boid->vx) + multfix15(normal_y, boid->vy);
-                    boid->x = peg_x[next_peg_arr[i]] + multfix15(normal_x, collision_distance + int2fix15(1));
-                    boid->y = peg_y[next_peg_arr[i]] + multfix15(normal_y, collision_distance + int2fix15(1));
-                    // Only reflect when moving toward the peg, not away from it.
-                    if (dot < 0)
-                    {
-                        fix15 intermediate_term = -2 * dot;
-                        boid->vx += multfix15(normal_x, intermediate_term);
-                        boid->vy += multfix15(normal_y, intermediate_term);
-                        // Sound and damping only when this boid hits a different peg.
-                        if (boid->last_peg != next_peg_arr[i])
-                        {
-                            ++stats->peg_sound_events;
-                            fix15 bounce = int2fix15(current_bounciness) / 100;
-
-                            boid->vx = multfix15(boid->vx, bounce);
-                            boid->vy = multfix15(boid->vy, bounce);
-                            boid->last_peg = next_peg_arr[i];
-                        }
-                    }
-                }
-            }
+        // ADD ETIHER THIS OR THE ELSE BLOCK
+    } else {
+        const int R = boid_RADIUS + PEG_RADIUS;
+        int dy = fix2int15(boid->y) - fix2int15(PEG_Y);
+        int r0 = (dy - R > 0) ? (dy - R) / PEG_VERTICAL_SPACING : 0;
+        int r1 = (dy + R < 0) ? -1 : (dy + R) / PEG_VERTICAL_SPACING;
+        if (r1 > PEG_ROWS - 1) r1 = PEG_ROWS - 1;
+        for (int row = r0; row <= r1; ++row) {
+            int start = row * (row + 1) / 2;
+            for (int col = 0; col <= row; ++col)
+                collidePeg(boid, start + col, stats);
         }
     }
 
@@ -406,7 +465,7 @@ static void updateboid(boid *boid, core_stats *stats)
     {
         ++stats->total_fallen;
 
-        dropboid(boid);
+        dropboid(boid, &spawn_rng);
         return; // reset the new drop's initial y-velocity to zero
     }
     boid->vy += GRAVITY; // add
@@ -415,25 +474,40 @@ static void updateboid(boid *boid, core_stats *stats)
 // draw the stats: # boids being animated, total # of boids fallen since reset, and time since boot
 static void drawStats(void)
 {
-    char text[80];
+    // Static text buffers
+    static char count_text[32], fallen_text[48], time_text[32], bounce_text[32];
+    static int last_count = -1, last_bounce = -1;
+    static uint64_t last_fallen = UINT64_MAX, last_seconds = UINT64_MAX;
+
     uint64_t seconds = time_us_64() / 1000000u;
+
+    // Only update string buffers when values actually change
+    if (boid_count != last_count) {
+        snprintf(count_text, sizeof(count_text), "Boids: %d", boid_count);
+        last_count = boid_count;
+    }
+    if (total_fallen != last_fallen) {
+        snprintf(fallen_text, sizeof(fallen_text), "Fallen: %llu", (unsigned long long)total_fallen);
+        last_fallen = total_fallen;
+    }
+    if (seconds != last_seconds) {
+        snprintf(time_text, sizeof(time_text), "Time: %llu:%02u:%02u",
+                 (unsigned long long)(seconds / 3600),
+                 (unsigned)((seconds / 60) % 60), (unsigned)(seconds % 60));
+        last_seconds = seconds;
+    }
+    if (bounciness_level != last_bounce) {
+        snprintf(bounce_text, sizeof(bounce_text), "Bounciness: %d/%d", bounciness_level, BOUNCE_LEVEL_MAX);
+        last_bounce = bounciness_level;
+    }
+
     setTextSize(2);
     setTextColor(WHITE);
-    setCursor(10, 5);
-    snprintf(text, sizeof(text), "Boids being animated: %d", boid_count);
-    writeString(text);
-    setCursor(10, 22);
-    snprintf(text, sizeof(text), "Total fallen since reset: %llu",
-             (unsigned long long)total_fallen);
-    writeString(text);
-    setCursor(10, 39);
-    snprintf(text, sizeof(text), "Time since boot: %llu:%02u:%02u",
-             (unsigned long long)(seconds / 3600),
-             (unsigned)((seconds / 60) % 60), (unsigned)(seconds % 60));
-    writeString(text);
-    setCursor(10, 56);
-    snprintf(text, sizeof(text), "Bounciness: %d", current_bounciness);
-    writeString(text);
+
+    setCursor(10, 5);  writeString(count_text);
+    setCursor(10, 22); writeString(fallen_text);
+    setCursor(10, 39); writeString(time_text);
+    setCursor(10, 56); writeString(bounce_text);
 }
 
 // Bars align with the fifteen gaps in the bottom peg row.
@@ -452,9 +526,44 @@ static void drawHistogram(void)
     }
 }
 
+void renderHollowBoidsParallel(unsigned parity) {
+    // Separate 256-entry direct-mapped cache for each core/parity
+    static uint32_t drawn_centers[2][256];
+    uint32_t *cache = drawn_centers[parity & 1u];
+
+    // Reset the cache for this core's frame pass
+    memset(cache, 0xFF, sizeof(drawn_centers[0]));
+
+    for (int i = 0; i < frame_boid_count; ++i) {
+        short px = (short)fix2int15(boids[i].x);
+        short py = (short)fix2int15(boids[i].y);
+
+        if (px >= -boid_RADIUS && px <= 640 + boid_RADIUS &&
+            py >= -boid_RADIUS && py <= 480 + boid_RADIUS) {
+
+            // Pack coordinates into a 32-bit key
+            uint32_t key = ((uint32_t)(py + boid_RADIUS) << 16) | (uint32_t)(px + boid_RADIUS);
+            
+            // Hash key into a 0-255 cache slot
+            unsigned slot = (key ^ (key >> 8)) & 0xFFu;
+
+            // If a boid was already drawn at this exact coordinate, skip it!
+            if (cache[slot] == key) continue;
+            
+            cache[slot] = key; // Update cache entry
+
+            drawCircleParity(px, py, boid_RADIUS, WHITE, parity);
+        }
+    }
+}
+
 // Animation on core 0
 static PT_THREAD(protothread_anim(struct pt *pt))
 {
+    // LED missed timing variables init
+    static uint32_t frame_start_us = 0, elapsed_us = 0;
+    static bool missed_deadline = false;
+
     // Mark beginning of thread
     PT_BEGIN(pt);
 
@@ -465,19 +574,34 @@ static PT_THREAD(protothread_anim(struct pt *pt))
     {
         // Wait for the signal that the buffer's changed
         PT_YIELD_UNTIL(pt, draw_start_signal());
+        frame_start_us = draw_frame_start_us(); // start counting frame draw time
         syncboidCount();
         frame_boid_count = boid_count;
         count_core0 = frame_boid_count / 2 + frame_boid_count % 2;
-        
-        multicore_fifo_push_blocking(FLAG_VALUE);
 
-        for (int i = 0; i < count_core0; ++i) {
+        // if Core 1 finishes its physics loop early and pushes its completion flag, Core 0 might miss it if timing gets desynced
+        while (multicore_fifo_rvalid()) multicore_fifo_pop_blocking(); // Drain stale tokens
+        multicore_fifo_push_blocking(FLAG_VALUE); // Signal Core 1 to begin physics
+
+        for (int i = 0; i < count_core0; ++i) // update boid physics
             updateboid(&boids[i], &stats0);
-        }
-        multicore_fifo_push_blocking(FLAG_VALUE);
+
+        PT_YIELD_UNTIL(pt, multicore_fifo_rvalid()); // wait for core 1 to finish
+        multicore_fifo_pop_blocking();
         // synchronized now with core 1, safe to draw
 
-        // NEW: combine core 0 and core 1 histogram
+        // IF ROTARY ENCODER ISR CALLED: RESET total balls fallen & histogram
+        uint32_t irq = save_and_disable_interrupts();
+        bool reset = stats_reset_pending;
+        stats_reset_pending = false;
+        restore_interrupts(irq);
+        if (reset) {
+            stats0.total_fallen = stats1.total_fallen = 0;
+            memset(stats0.histogram, 0, sizeof(stats0.histogram));
+            memset(stats1.histogram, 0, sizeof(stats1.histogram));
+        }
+        
+        // MERGE: combine core 0 and core 1 histogram
         for (int bin = 0; bin < HISTOGRAM_BINS; ++bin) {
             histogram[bin] = stats0.histogram[bin] + stats1.histogram[bin];
         }
@@ -487,17 +611,21 @@ static PT_THREAD(protothread_anim(struct pt *pt))
         // Clear the buffer
         clearLowFrame(0, BLACK);
         drawPegs();
-        for (int i = 0; i < frame_boid_count; ++i) {
-            // Avoid drawing off-screen coordinates while a boid falls past the sides.
-            if (boids[i].x >= -int2fix15(boid_RADIUS) && boids[i].x <= int2fix15(640 + boid_RADIUS) &&
-                boids[i].y >= -int2fix15(boid_RADIUS) && boids[i].y <= int2fix15(480 + boid_RADIUS))
-                drawCircle((short)fix2int15(boids[i].x), (short)fix2int15(boids[i].y), boid_RADIUS, color);
-        }
-        
+
+        multicore_fifo_push_blocking(FLAG_VALUE); // Signal Core 1 to start drawing scanlines
+        // draw even scanlines
+        renderHollowBoidsParallel(0); // 0 = even rows
+        PT_YIELD_UNTIL(pt, multicore_fifo_rvalid()); // Wait for Core 1 drawing to finish
+        multicore_fifo_pop_blocking();
+
         drawStats();
         drawHistogram();
+        // Keep the LED on until the next frame completes within its deadline.
+        elapsed_us = (uint32_t)(time_us_32() - frame_start_us);
+        missed_deadline = elapsed_us > FRAME_BUDGET_US || draw_frame_expired();
+        vga_frame_complete(); // No framebuffer writes until the next acquisition.
+        gpio_put(DEADLINE_LED_PIN, missed_deadline);
 
-        multicore_fifo_push_blocking(FLAG_VALUE); // synchronize w Core 1 to proceed to next frame
         // NEVER exit while
     } // END WHILE(1)
     PT_END(pt);
@@ -512,12 +640,20 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
 
     while (1)
     {
-        multicore_fifo_pop_blocking();
-        for (int i = count_core0; i < frame_boid_count; ++i) {
-                updateboid(&boids[i], &stats1);
-        }
-        multicore_fifo_pop_blocking(); // synchronize w Core 0 to proceed with drawing
-        multicore_fifo_pop_blocking(); // synchronize w Core 0 to proceed to next frame
+        multicore_fifo_pop_blocking(); // wait for start
+
+        // update boid physics
+        for (int i = count_core0; i < frame_boid_count; ++i) 
+            updateboid(&boids[i], &stats1);
+
+        multicore_fifo_push_blocking(FLAG_VALUE); // Signal physics done
+
+        multicore_fifo_pop_blocking(); // Wait for scanlinedraw signal
+        // draw odd scanlines
+        renderHollowBoidsParallel(1); // 1 = odd rows
+        multicore_fifo_push_blocking(FLAG_VALUE); // Signal draw done
+
+        multicore_fifo_push_blocking(FLAG_VALUE); // done
     }
     PT_END(pt);
 }
@@ -557,13 +693,22 @@ void core1_main(){
 // USE ONLY C-sdk library
 int main()
 {
-    set_sys_clock_khz(300000, true);
+    // Core DVDD, NOT the 3.3 V I/O rail. Keep the SDK voltage limit enabled.
+    // Raise voltage before the existing 300 MHz overclock (board-test required).
     vreg_set_voltage(VREG_VOLTAGE_1_30);
+    sleep_ms(10);
+    set_sys_clock_khz(400000, true);
     // initialize stio
     stdio_init_all();
 
     // initialize VGA
     initVGA();
+
+    // LED PIN FOR INDICATING MISSED DEADLINES (ON IF MISSED)
+    gpio_init(DEADLINE_LED_PIN);
+    gpio_put(DEADLINE_LED_PIN, false);
+    gpio_set_dir(DEADLINE_LED_PIN, GPIO_OUT);
+
 
     // ========================================
     // === ROTARY PINS !!!
@@ -597,8 +742,8 @@ int main()
         float t = (float)i / 44000.0f; // 44,000 samples/s
         float thump =
             2047 +                            // midpoint or "zero"
-            1800 * expf(-800.0f * t)          // amplitude * decay factor
-                 * sinf(2.0f * 3.14159f * 150.0f * t);  // oscillation, 150Hz sine wave
+            1500 * expf(-45.0f * t)         // amplitude * decay factor
+                 * sinf(2.0f * 3.14159f * 120.0f * t) + 500 * expf(-180.0f * t) * sinf(2.0f * 3.14159f * 350.0f * t);  // oscillation, 150Hz sine wave
         DAC_data[i] = DAC_config_chan_A | (((int)thump) & 0x0fff); // takes calculated 12b sample -> 16b for DAC
     }
 
@@ -647,7 +792,7 @@ int main()
     channel_config_set_write_increment(&c2, false);                    // no write incrementing
     // Timer rate = sys_clk * X/Y. At this program's 150 MHz: 44,000 samples/s.
     int audio_timer = dma_claim_unused_timer(true);
-    dma_timer_set_fraction(audio_timer, 11, 37500);
+    dma_timer_set_fraction(audio_timer, 1, 9091);
     channel_config_set_dreq(&c2, dma_get_timer_dreq(audio_timer));
     // chain back to data channel because unlike the demo we don't want it to keep looping
     channel_config_set_chain_to(&c2, data_chan);
@@ -663,7 +808,9 @@ int main()
     // The sound thread starts DMA only when a peg impact is queued.
 
     // Randomize the initial horizontal velocity of each boid.
-    srand(time_us_32());
+    spawn_rng  = time_us_32() | 1u;
+    stats0.rng = spawn_rng ^ 0x9e3779b9u;
+    stats1.rng = spawn_rng ^ 0x85ebca6bu;
 
     // start core 1 
     multicore_reset_core1();
