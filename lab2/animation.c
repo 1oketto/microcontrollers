@@ -1,7 +1,7 @@
 /**
  * Hunter Adams (vha3@cornell.edu)
  *
- * Stores up to 20,000 balls; startup calibration measures this board's capacity.
+ * Ball storage grows on demand; the initial count is configurable at build time.
  * Both cores update physics and render disjoint scanlines.
  * The rotary encoder controls ball count or bounciness; click to switch.
  * Encoder button: between GPIO 15 (input) and GPIO 12 (output low).
@@ -79,7 +79,6 @@ static uint32_t peg_sound_events = 0; // how many collisions have happened
 
 // 60 fps gives each animation frame 16,666 microseconds.
 #define FRAME_BUDGET_US (1000000u / 60u)
-#define DEADLINE_LED_PIN PICO_DEFAULT_LED_PIN
 #ifndef LAB_BENCH_VARIANT
 #define LAB_BENCH_VARIANT "full"
 #endif
@@ -88,6 +87,12 @@ static uint32_t peg_sound_events = 0; // how many collisions have happened
 #endif
 #ifndef LAB_CALIBRATION_FRAMES
 #define LAB_CALIBRATION_FRAMES 600u
+#endif
+#ifndef LAB_INITIAL_BALL_COUNT
+#define LAB_INITIAL_BALL_COUNT 20000
+#endif
+#ifndef LAB_CAPACITY_CALIBRATION
+#define LAB_CAPACITY_CALIBRATION 0
 #endif
 #ifndef LAB_SINGLE_CORE
 #define LAB_SINGLE_CORE 0
@@ -102,15 +107,22 @@ static uint32_t peg_sound_events = 0; // how many collisions have happened
 #define LAB_NO_TEXT_CACHE 0
 #endif
 _Static_assert(LAB_CALIBRATION_FRAMES > 0, "A trial must time at least one frame");
-#define MAX_BALLS 20000
+#define ROTARY_BALL_STEP 500
+_Static_assert(LAB_INITIAL_BALL_COUNT >= 0, "Initial ball count cannot be negative");
+_Static_assert(LAB_INITIAL_BALL_COUNT <= INT_MAX, "Initial ball count exceeds the supported count type");
+#if LAB_CAPACITY_CALIBRATION
+#define CALIBRATION_MAX_BALLS 20000
 static volatile bool calibrating = true;
 static int calibration_good = -1; // No untested count is assumed to pass.
-static int calibration_bad = MAX_BALLS + 1;
+static int calibration_bad = CALIBRATION_MAX_BALLS + 1;
 static unsigned calibration_frames = 0;
 static unsigned calibration_warmup = 0;
 static uint64_t calibration_total_us = 0;
 static uint32_t calibration_max_us = 0;
-static int calibration_target = MAX_BALLS;
+static int calibration_target = CALIBRATION_MAX_BALLS;
+#else
+static volatile bool calibrating = false;
+#endif
 
 // rotary encoder GPIOs (C_PIN is connected to GND pin 18)
 #define A_PIN 13
@@ -118,14 +130,14 @@ static int calibration_target = MAX_BALLS;
 #define BUTTON_PIN 15
 #define BUTTON_GROUND_PIN 12 // Driven low; switch wired between GPIO 15 and 12.
 
-static volatile int rotary_count = 0; // Requested active boids; never negative.
+static volatile int rotary_count = LAB_INITIAL_BALL_COUNT; // Requested active boids.
 static atomic_bool edit_bounciness = false; // Shared between the two cores.
-// Encoder steps: 0, 1/16, 1/8, 1/4, 1/2, 1. Q15 remains the display format.
-#define BOUNCE_LEVEL_MAX 5
-#define BOUNCE_OFF_SHIFT 31u
-static volatile int bounciness_level = 3;
-static volatile int bounciness_q15 = 32768 >> 2;
+// Bounciness ranges from 0% to 100% in 10% steps.
+#define BOUNCE_LEVEL_MAX 10
+static volatile int bounciness_level = 5;
+static volatile int bounciness_q15 = (5 * 32768 + 5) / 10;
 static volatile bool statistics_reset_pending = false;
+static bool ball_allocation_failed = false;
 
 // GPIO edges restart the debounce interval; a timer IRQ checks the result.
 // A held button toggles only once, and must be released before another click.
@@ -171,27 +183,32 @@ static void core1_entry(void);
 // Rotation GPIO ISR runs only on core 0: CW is A falls while B is high.
 void gpio_callback(uint gpio, uint32_t events)
 {
-    if (calibrating || gpio != A_PIN || !(events & GPIO_IRQ_EDGE_FALL))
+    if (gpio != A_PIN || !(events & GPIO_IRQ_EDGE_FALL))
         return;
+    // A manual adjustment takes over immediately instead of waiting for the
+    // multi-trial startup calibration to finish.
+    calibrating = false;
     if (edit_bounciness) {
         int level = bounciness_level + (gpio_get(B_PIN) ? 1 : -1);
         if (level < 0) level = 0;
         if (level > BOUNCE_LEVEL_MAX) level = BOUNCE_LEVEL_MAX;
         if (level != bounciness_level) {
             bounciness_level = level;
-            bounciness_q15 = level == 0 ? 0 : 32768 >> (BOUNCE_LEVEL_MAX - level);
+            bounciness_q15 = (level * 32768 + BOUNCE_LEVEL_MAX / 2) /
+                             BOUNCE_LEVEL_MAX;
             statistics_reset_pending = true;
         }
         return;
     }
     if (gpio_get(B_PIN))
     {
-        if (rotary_count < MAX_BALLS)
-            ++rotary_count;
+        rotary_count = rotary_count > INT_MAX - ROTARY_BALL_STEP
+            ? INT_MAX : rotary_count + ROTARY_BALL_STEP;
     }
-    else if (rotary_count > 0)
+    else
     {
-        --rotary_count;
+        rotary_count = rotary_count > ROTARY_BALL_STEP
+            ? rotary_count - ROTARY_BALL_STEP : 0;
     }
 }
 
@@ -223,16 +240,6 @@ static PT_THREAD(protothread_sound(struct pt *pt))
 static const char color = WHITE;
 
 typedef signed int fix15;
-// Unsigned magnitudes make right shifts portable and preserve C division's
-// truncation toward zero for negative values (an arithmetic shift rounds down).
-static inline int32_t shiftRightTrunc32(int32_t value, unsigned shift)
-{
-    if (shift == 0) return value;
-    uint32_t magnitude = value < 0 ? 0u - (uint32_t)value : (uint32_t)value;
-    int32_t result = (int32_t)(magnitude >> shift);
-    return value < 0 ? -result : result;
-}
-
 static inline fix15 multiplyFix15(fix15 a, fix15 b)
 {
     int64_t product = (int64_t)a * b;
@@ -257,23 +264,20 @@ static inline fix15 multiplyFix15(fix15 a, fix15 b)
 // Center-to-center spacing between pegs and rows.
 #define PEG_HORIZONTAL_SPACING BOARD_PEG_HORIZONTAL_SPACING
 #define PEG_VERTICAL_SPACING BOARD_PEG_VERTICAL_SPACING
+#define CONTACT_RADIUS (boid_RADIUS + PEG_RADIUS)
 #define PEG_X int2fix15(BOARD_CENTER_X)
 #define PEG_Y int2fix15(BOARD_TOP_Y)
 #define GRAVITY ((fix15)12124)
 #define BOUNCINESS ((fix15)bounciness_q15)
+#define RANDOM_LATERAL_KICK_Q15 16384 // 0.5 pixels/frame, with a fair random sign.
 
 // Independent ablations for on-board measurements; default to optimized paths.
 #ifndef LAB_FULL_PEG_SCAN
 #define LAB_FULL_PEG_SCAN 0
 #endif
-#ifndef LAB_GENERAL_DAMPING
-#define LAB_GENERAL_DAMPING 0
-#endif
 #ifndef LAB_REFERENCE_NORMAL
 #define LAB_REFERENCE_NORMAL 0
 #endif
-_Static_assert(boid_RADIUS + PEG_RADIUS == (1u << BOARD_COLLISION_RADIUS_SHIFT),
-               "collision radius must remain a power of two");
 _Static_assert((PEG_HORIZONTAL_SPACING & 1) == 0, "peg spacing must be even");
 
 static fix15 peg_x[PEG_COUNT], peg_y[PEG_COUNT];
@@ -307,8 +311,9 @@ typedef struct
     bool histogram_recorded;
 } boid;
 #define NO_PEG UINT8_MAX
-_Static_assert(sizeof(boid) == 10, "20,000 balls must fit in 200 KB");
-static boid boids[MAX_BALLS];
+_Static_assert(sizeof(boid) == 10, "Ball storage must remain compact");
+static boid *boids;
+static int boid_capacity;
 static int boid_count = 0;
 
 // Round to the compact format. Saturation keeps off-screen trajectories from
@@ -360,12 +365,28 @@ static void dropboid(boid *ball, uint32_t *rng)
     ball->histogram_recorded = false;
 }
 
-// The fixed pool removes reallocations, heap fragmentation and worker hazards.
+// Resize only between worker jobs so neither core can retain a stale ball pointer.
 static void syncboidCount(void)
 {
     int requested = rotary_count;
-    if (requested > MAX_BALLS) requested = MAX_BALLS;
     if (requested < 0) requested = 0;
+    if (requested > boid_capacity) {
+        boid *resized = NULL;
+        if ((size_t)requested <= SIZE_MAX / sizeof(*boids))
+            resized = realloc(boids, (size_t)requested * sizeof(*boids));
+        if (resized == NULL) {
+            ball_allocation_failed = true;
+            uint32_t irq_state = save_and_disable_interrupts();
+            if (rotary_count == requested)
+                rotary_count = boid_capacity;
+            restore_interrupts(irq_state);
+            requested = boid_capacity;
+        } else {
+            boids = resized;
+            boid_capacity = requested;
+            ball_allocation_failed = false;
+        }
+    }
     for (int i = boid_count; i < requested; ++i)
         dropboid(&boids[i], &spawn_rng);
     boid_count = requested;
@@ -386,6 +407,7 @@ static void resetStatisticsIfRequested(void)
 }
 
 // Start each trial with the same drop sequence so counts are comparable.
+#if LAB_CAPACITY_CALIBRATION
 static void startCalibrationTrial(int count)
 {
     calibration_target = count;
@@ -440,7 +462,8 @@ static void finishCalibrationFrame(bool missed_deadline, uint32_t elapsed_us)
         calibrating = false;
         if (calibration_good >= 0)
             printf("CAPACITY,%s,%d,%d,%u\n", LAB_BENCH_VARIANT,
-                   calibration_good, MAX_BALLS, calibration_good == MAX_BALLS);
+                   calibration_good, CALIBRATION_MAX_BALLS,
+                   calibration_good == CALIBRATION_MAX_BALLS);
         else
             printf("BENCH_ERROR,%s,even_zero_balls_missed_deadline\n", LAB_BENCH_VARIANT);
         return;
@@ -448,6 +471,7 @@ static void finishCalibrationFrame(bool missed_deadline, uint32_t elapsed_us)
     int next = calibration_good + (calibration_bad - calibration_good) / 2;
     startCalibrationTrial(next);
 }
+#endif
 
 // Pico 2 has hardware floating-point square root. Use it for an initial root,
 // then correct against the exact integer square to retain Q15 collision results.
@@ -494,41 +518,39 @@ static inline fix15 normalComponent(fix15 component, fix15 distance, float scale
 #endif
 }
 
-static unsigned bouncinessShift(fix15 bounciness)
+static inline fix15 dampVelocity(fix15 velocity, fix15 bounciness)
 {
-    // The encoder emits only zero or powers of two. Decode once per core/frame.
-    return bounciness == 0 ? BOUNCE_OFF_SHIFT :
-           15u - (unsigned)__builtin_ctz((unsigned)bounciness);
-}
-
-static inline fix15 dampVelocity(fix15 velocity, unsigned shift)
-{
-    if (shift == BOUNCE_OFF_SHIFT) return 0;
-#if LAB_GENERAL_DAMPING
-    return multfix15(velocity, (fix15)(32768u >> shift));
-#else
-    return shiftRightTrunc32(velocity, shift);
-#endif
+    return multfix15(velocity, bounciness);
 }
 
 static inline fix15 collisionClearance(fix15 normal)
 {
-    // Eight pixels to contact, plus one pixel of clearance: n * 9 = (n * 8) + n.
-    // Shift the nonnegative magnitude; left-shifting negative signed n is UB.
+    // Place the ball one pixel beyond the combined ball/peg contact radius.
     uint32_t magnitude = normal < 0 ? 0u - (uint32_t)normal : (uint32_t)normal;
-    fix15 offset = (fix15)((magnitude << BOARD_COLLISION_RADIUS_SHIFT) + magnitude);
+    fix15 offset = (fix15)(magnitude * (CONTACT_RADIUS + 1u));
     return normal < 0 ? -offset : offset;
 }
 
-static void updateboid(boid *ball, physics_state *state, unsigned bounce_shift)
+static void updateboid(boid *ball, physics_state *state, fix15 bounciness)
 {
+    const int radius = boid_RADIUS + PEG_RADIUS;
+    const fix15 collision_distance = int2fix15(radius);
+    if (ball->last_peg != NO_PEG && ball->last_peg >= PEG_COUNT) {
+        ball->last_peg = NO_PEG;
+    } else if (ball->last_peg != NO_PEG) {
+        fix15 previous_dx = (fix15)ball->x * 1024 - peg_x[ball->last_peg];
+        fix15 previous_dy = (fix15)ball->y * 1024 - peg_y[ball->last_peg];
+        int64_t previous_distance_squared = (int64_t)previous_dx * previous_dx +
+                                            (int64_t)previous_dy * previous_dy;
+        if (previous_distance_squared >= (int64_t)collision_distance * collision_distance)
+            ball->last_peg = NO_PEG;
+    }
+
     fix15 vx = (fix15)ball->vx * 32;
     fix15 vy = (fix15)ball->vy * 32;
     fix15 x = (fix15)ball->x * 1024 + vx;
     fix15 y = (fix15)ball->y * 1024 + vy;
 
-    const int radius = boid_RADIUS + PEG_RADIUS;
-    const fix15 collision_distance = (fix15)(32768u << BOARD_COLLISION_RADIUS_SHIFT);
     // Conservative lower bounds preserve the full scan's row/column order.
     // Later rows/columns test the current position after collision correction.
 #if LAB_FULL_PEG_SCAN
@@ -561,11 +583,12 @@ static void updateboid(boid *ball, physics_state *state, unsigned bounce_shift)
             if (absfix15(dx) < collision_distance && absfix15(dy) < collision_distance)
             {
                 int64_t distance_squared = (int64_t)dx * dx + (int64_t)dy * dy;
-                if (distance_squared < (INT64_C(1) << (30 + 2 * BOARD_COLLISION_RADIUS_SHIFT)))
+                if (distance_squared < (int64_t)collision_distance * collision_distance)
                 {
                     fix15 distance = distanceFix15(dx, dy);
                     // Normalize by the ACTUAL distance, which varies during penetration.
-                    // Radius eight does not make dx/distance interchangeable with dx >> 3.
+                    // The combined radius is not a power of two, so dx/distance
+                    // cannot be replaced with a bit shift.
                     // Coincident centers use an upward normal to avoid division by zero.
                     float normal_scale = distance > 0 ? 32768.0f / (float)distance : 0.0f;
                     fix15 normal_x = distance > 0 ? normalComponent(dx, distance, normal_scale) : 0;
@@ -583,8 +606,11 @@ static void updateboid(boid *ball, physics_state *state, unsigned bounce_shift)
                         if (ball->last_peg != peg)
                         {
                             ++state->collisions;
-                            vx = dampVelocity(vx, bounce_shift);
-                            vy = dampVelocity(vy, bounce_shift);
+                            vx = dampVelocity(vx, bounciness);
+                            vy = dampVelocity(vy, bounciness);
+                            vx += (nextRandom(&state->rng) & 0x80000000u)
+                                ? RANDOM_LATERAL_KICK_Q15
+                                : -RANDOM_LATERAL_KICK_Q15;
                             ball->last_peg = peg;
                         }
                     }
@@ -629,9 +655,9 @@ static void updateRange(int begin, int end, physics_state *state)
     state->collisions = 0;
     state->fallen = 0;
     memset(state->histogram, 0, sizeof(state->histogram));
-    unsigned bounce_shift = bouncinessShift(frame_bounciness);
+    fix15 bounciness = frame_bounciness;
     for (int i = begin; i < end; ++i)
-        updateboid(&boids[i], state, bounce_shift);
+        updateboid(&boids[i], state, bounciness);
 }
 
 static void drawBallRows(unsigned parity);
@@ -665,6 +691,15 @@ static void mergePhysics(void)
 // overlapping balls. All physics must finish before either renderer reads them.
 static void drawBallRows(unsigned parity)
 {
+    for (int row = 0; row < PEG_ROWS; ++row) {
+        for (int col = 0; col <= row; ++col) {
+            short x = (short)(BOARD_CENTER_X +
+                              (2 * col - row) * PEG_HORIZONTAL_SPACING / 2);
+            short y = (short)(BOARD_TOP_Y + row * PEG_VERTICAL_SPACING);
+            newCircleRows(x, y, parity);
+        }
+    }
+
     // An exact-key cache skips redundant stamps when many balls overlap.
     // Hash collisions merely cause another draw; they never hide another ball.
 #if !LAB_NO_DRAW_CACHE
@@ -673,21 +708,22 @@ static void drawBallRows(unsigned parity)
     memset(cache, 0xff, sizeof(drawn_centers[0]));
 #endif
     for (int i = 0; i < boid_count; ++i) {
+        if (boids[i].histogram_recorded) continue;
         int x = boids[i].x >> 5;
         int y = boids[i].y >> 5;
-        if (x >= -boid_RADIUS && x <= 639 + boid_RADIUS &&
-            y >= -boid_RADIUS && y <= 479 + boid_RADIUS) {
+        if (x >= -BOARD_BALL_DRAW_RADIUS && x <= 639 + BOARD_BALL_DRAW_RADIUS &&
+            y >= -BOARD_BALL_DRAW_RADIUS && y <= 479 + BOARD_BALL_DRAW_RADIUS) {
 #if !LAB_NO_DRAW_CACHE
-            uint32_t key = ((uint32_t)(y + boid_RADIUS) << 10) |
-                           (uint32_t)(x + boid_RADIUS);
+            uint32_t key = ((uint32_t)(y + BOARD_BALL_DRAW_RADIUS) << 10) |
+                           (uint32_t)(x + BOARD_BALL_DRAW_RADIUS);
             unsigned slot = (key ^ (key >> 8)) & 255u;
             if (cache[slot] == key) continue;
             cache[slot] = key;
 #endif
 #if LAB_GENERIC_CIRCLE
-            referenceCircleRows(x, y, parity);
+            referenceWhiteBallRows(x, y, parity);
 #else
-            newCircleRows(x, y, parity);
+            drawWhiteBallRows(x, y, parity);
 #endif
         }
     }
@@ -711,9 +747,8 @@ static void drawStats(void)
         last_fallen = total_fallen;
     }
     if (LAB_NO_TEXT_CACHE || bounciness != last_bounciness) {
-        snprintf(bounce_text, sizeof(bounce_text), "%d.%02d%%",
-                 (bounciness * 10000 / 32768) / 100,
-                 (bounciness * 10000 / 32768) % 100);
+        snprintf(bounce_text, sizeof(bounce_text), "%d%%",
+                 bounciness_level * 10);
         last_bounciness = bounciness;
     }
     if (LAB_NO_TEXT_CACHE || seconds != last_seconds) {
@@ -723,21 +758,35 @@ static void drawStats(void)
         last_seconds = seconds;
     }
     setTextSize(1);
-    setTextColor(WHITE);
+    setTextColor2(WHITE, BLACK);
     // Separate selection marker from the fixed left edge of every label.
     setCursor(10, edit_bounciness ? 30 : 10);
     writeString(">");
+    setCursor(22, 10);
+    writeString("boids being animated: ");
     setCursor(22 + 6 * (sizeof("boids being animated: ") - 1), 10);
     writeString(ball_text);
+    setCursor(22, 20);
+    writeString("Total fallen since reset: ");
     setCursor(22 + 6 * (sizeof("Total fallen since reset: ") - 1), 20);
     writeString(fallen_text);
+    setCursor(22, 30);
+    writeString("Bounciness: ");
     setCursor(22 + 6 * (sizeof("Bounciness: ") - 1), 30);
     writeString(bounce_text);
+    setCursor(22, 40);
+    writeString("Time since boot: ");
     setCursor(22 + 6 * (sizeof("Time since boot: ") - 1), 40);
     writeString(time_text);
+#if LAB_CAPACITY_CALIBRATION
     if (calibrating) {
         setCursor(22, 50);
         writeString("Calibrating 60 fps capacity...");
+    }
+#endif
+    if (ball_allocation_failed) {
+        setCursor(22, 50);
+        writeString("Ball memory limit reached");
     }
 }
 
@@ -783,15 +832,17 @@ static PT_THREAD(protothread_anim(struct pt *pt))
     // Mark beginning of thread
     PT_BEGIN(pt);
 
-    // Measure capacity on this board before the initial drop.
     initPegs();
+#if LAB_CAPACITY_CALIBRATION
     startCalibrationTrial(calibration_target);
+#endif
 
     while (1)
     {
         // Wait for the signal that the buffer's changed
         PT_YIELD_UNTIL(pt, draw_start_signal());
         frame_start_us = draw_frame_start_us();
+        clearRegion(0, 480, BLACK);
         // The previous worker has completed before any resize or new drop.
         syncboidCount();
         frame_bounciness = BOUNCINESS;
@@ -819,12 +870,12 @@ static PT_THREAD(protothread_anim(struct pt *pt))
         resetStatisticsIfRequested();
         drawStats();
         drawHistogram();
-        // Keep the LED on until the next frame completes within its deadline.
         elapsed_us = (uint32_t)(time_us_32() - frame_start_us);
         missed_deadline = elapsed_us > FRAME_BUDGET_US || draw_frame_expired();
         vga_frame_complete(); // No framebuffer writes until the next acquisition.
-        gpio_put(DEADLINE_LED_PIN, missed_deadline);
+#if LAB_CAPACITY_CALIBRATION
         finishCalibrationFrame(missed_deadline, elapsed_us);
+#endif
         // NEVER exit while
     } // END WHILE(1)
     PT_END(pt);
@@ -844,10 +895,6 @@ int main()
     set_sys_clock_khz(300000, true);
     // initialize stio
     stdio_init_all();
-
-    gpio_init(DEADLINE_LED_PIN);
-    gpio_put(DEADLINE_LED_PIN, false);
-    gpio_set_dir(DEADLINE_LED_PIN, GPIO_OUT);
 
     // initialize VGA
     initVGA();

@@ -30,24 +30,21 @@ add_executable(VGA_Animation_Demo)
 
 target_compile_options(VGA_Animation_Demo PRIVATE -O3)
 
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
-add_custom_target(check_vga_background
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/tools/generate_vga_background.py --check
-    COMMENT "Checking flash bitmap against board geometry and fonts")
-add_dependencies(VGA_Animation_Demo check_vga_background)
-
 # One-variable ablations for on-board measurements. These are comparisons with
 # the final build, not cumulative speedups and not substitutes for old firmware.
 set(LAB_BENCH_VARIANT "full" CACHE STRING "Benchmark variant")
-set_property(CACHE LAB_BENCH_VARIANT PROPERTY STRINGS full full_scan single_core pixel_stamps ram_background general_damping reference_normal no_draw_cache no_text_cache)
+set_property(CACHE LAB_BENCH_VARIANT PROPERTY STRINGS full full_scan single_core pixel_stamps reference_normal no_draw_cache no_text_cache)
+set(LAB_INITIAL_BALL_COUNT 20000 CACHE STRING "Initial number of balls")
+if(NOT LAB_INITIAL_BALL_COUNT MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "LAB_INITIAL_BALL_COUNT must be a non-negative integer")
+endif()
+option(LAB_CAPACITY_CALIBRATION "Run the startup capacity search for benchmarks" OFF)
 set(LAB_CALIBRATION_WARMUP_FRAMES 600 CACHE STRING "Frames before timing each trial")
 set(LAB_CALIBRATION_FRAMES 600 CACHE STRING "Timed frames per capacity trial")
 set(LAB_BENCH_DEFINITIONS
     full_scan:LAB_FULL_PEG_SCAN
     single_core:LAB_SINGLE_CORE
     pixel_stamps:LAB_GENERIC_CIRCLE
-    ram_background:LAB_RAM_BACKGROUND
-    general_damping:LAB_GENERAL_DAMPING
     reference_normal:LAB_REFERENCE_NORMAL
     no_draw_cache:LAB_NO_DRAW_CACHE
     no_text_cache:LAB_NO_TEXT_CACHE)
@@ -69,8 +66,12 @@ if(NOT LAB_VARIANT_FOUND)
 endif()
 target_compile_definitions(VGA_Animation_Demo PRIVATE
     LAB_BENCH_VARIANT="${LAB_BENCH_VARIANT}"
+    LAB_INITIAL_BALL_COUNT=${LAB_INITIAL_BALL_COUNT}
     LAB_CALIBRATION_WARMUP_FRAMES=${LAB_CALIBRATION_WARMUP_FRAMES}
     LAB_CALIBRATION_FRAMES=${LAB_CALIBRATION_FRAMES})
+if(LAB_CAPACITY_CALIBRATION)
+    target_compile_definitions(VGA_Animation_Demo PRIVATE LAB_CAPACITY_CALIBRATION=1)
+endif()
 
 # must match with pio filename and executable name from above
 pico_generate_pio_header(VGA_Animation_Demo ${CMAKE_CURRENT_LIST_DIR}/VGA/hsync.pio)

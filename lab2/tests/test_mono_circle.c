@@ -3,7 +3,6 @@
 #include <string.h>
 #include "../VGA/mono_circle.h"
 #include "../board_config.h"
-#include "../VGA/vga_background_data.h"
 
 #define BUFFER_BYTES (MONO_HEIGHT * MONO_ROW_BYTES)
 #define GUARD 32
@@ -31,12 +30,47 @@ static void check_position(int x, int y)
                 assert(!memcmp(actual + GUARD + row * MONO_ROW_BYTES,
                                initial + GUARD + row * MONO_ROW_BYTES,
                                MONO_ROW_BYTES));
+
+        memset(actual, 0, sizeof(actual));
+        memset(expected, 0, sizeof(expected));
+        mono_stamp_circle_outline(actual + GUARD, x, y, p);
+        mono_reference_circle_outline(expected + GUARD, x, y, p);
+        assert(!memcmp(actual, expected, sizeof(actual)));
+
+        memset(actual, 0, sizeof(actual));
+        memset(expected, 0, sizeof(expected));
+        mono_stamp_peg(actual + GUARD, x, y, p);
+        mono_reference_peg(expected + GUARD, x, y, p);
+        if (memcmp(actual, expected, sizeof(actual))) {
+            fprintf(stderr, "peg raster mismatch at (%d, %d), parity %u\n", x, y, p);
+            assert(0);
+        }
+
+        memset(actual, 0, sizeof(actual));
+        memset(expected, 0, sizeof(expected));
+        mono_stamp_ball_outline(actual + GUARD, x, y, p);
+        mono_reference_ball_outline(expected + GUARD, x, y, p);
+        assert(!memcmp(actual, expected, sizeof(actual)));
     }
     memset(actual, 0, sizeof(actual));
     memset(split, 0, sizeof(split));
     mono_stamp_circle(actual + GUARD, x, y, 2);
     mono_stamp_circle(split + GUARD, x, y, 0);
     mono_stamp_circle(split + GUARD, x, y, 1);
+    assert(!memcmp(actual, split, sizeof(actual)));
+
+    memset(actual, 0, sizeof(actual));
+    memset(split, 0, sizeof(split));
+    mono_stamp_peg(actual + GUARD, x, y, 2);
+    mono_stamp_peg(split + GUARD, x, y, 0);
+    mono_stamp_peg(split + GUARD, x, y, 1);
+    assert(!memcmp(actual, split, sizeof(actual)));
+
+    memset(actual, 0, sizeof(actual));
+    memset(split, 0, sizeof(split));
+    mono_stamp_ball_outline(actual + GUARD, x, y, 2);
+    mono_stamp_ball_outline(split + GUARD, x, y, 0);
+    mono_stamp_ball_outline(split + GUARD, x, y, 1);
     assert(!memcmp(actual, split, sizeof(actual)));
 }
 
@@ -49,16 +83,6 @@ int main(void)
             check_position(x, ys[y]);
     check_position(-32768, -32768);
     check_position(32767, 32767);
-    // All pre-rendered pegs match the production stamp at their exact coordinates.
-    memset(expected, 0, sizeof(expected));
-    for (int row = 0; row < BOARD_PEG_ROWS; ++row)
-        for (int col = 0; col <= row; ++col)
-            mono_stamp_circle(expected + GUARD, BOARD_CENTER_X + (2 * col - row) * BOARD_PEG_HORIZONTAL_SPACING / 2,
-                              BOARD_TOP_Y + row * BOARD_PEG_VERTICAL_SPACING, 2);
-    assert(sizeof(vga_background_flash) == BUFFER_BYTES);
-    assert(!memcmp(expected + GUARD + 50 * MONO_ROW_BYTES,
-                   vga_background_flash + 50 * MONO_ROW_BYTES,
-                   BUFFER_BYTES - 50 * MONO_ROW_BYTES));
-    puts("mono circles: clipping, exact reference raster, byte alignment, row ownership, and flash pegs passed");
+    puts("mono sprites: clipping, raster shapes, byte alignment, and row ownership passed");
     return 0;
 }

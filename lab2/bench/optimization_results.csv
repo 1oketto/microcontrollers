@@ -3,8 +3,6 @@ full,All optimizations,,,not measured
 full_scan,Without spatial filtering,,,not measured
 single_core,Without second worker core,,,not measured
 pixel_stamps,Without packed circle stamps,,,not measured
-ram_background,Without flash background,,,not measured
-general_damping,Without shift damping,,,not measured
 reference_normal,Without fast root / normal,,,not measured
 no_draw_cache,Without duplicate draw cache,,,not measured
 no_text_cache,Without text format cache,,,not measured

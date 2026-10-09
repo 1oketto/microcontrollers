@@ -13,7 +13,6 @@
 // Header file
 #include "vga16_graphics_v3.h"
 #include "mono_circle.h"
-#include "vga_background_data.h"
 // Font files
 #include "font_glcd.c"
 #include "font_ascii_characters.h"
@@ -83,26 +82,11 @@ unsigned char vga_buffer_0[VGA_BUFFER_COUNT] __attribute__((aligned(4)));
 unsigned char vga_buffer_1[VGA_BUFFER_COUNT] __attribute__((aligned(4)));
 char *current_draw_buffer;
 static uint8_t *display_buffer;
-static uint8_t *background_target;
-
-#ifndef LAB_RAM_BACKGROUND
-#define LAB_RAM_BACKGROUND 0
-#endif
-#if LAB_RAM_BACKGROUND
-// Optional ablation: exactly the same bitmap restored from SRAM instead of XIP.
-static uint8_t vga_background_ram[VGA_BUFFER_COUNT] __attribute__((aligned(4)));
-#define BACKGROUND_SOURCE vga_background_ram
-#else
-#define BACKGROUND_SOURCE vga_background_flash
-#endif
-
-static int rgb_data_chan, set_draw_chan, background_dma_chan, set_start_chan;
-static const uint32_t start_value = 1;
-static volatile uint32_t start_flag;
+static int rgb_data_chan;
 static volatile uint32_t frame_sequence;
 static uint32_t released_sequence, released_frame_start_us;
 static uint32_t drawing_sequence, drawing_frame_start_us;
-enum draw_state { DRAW_BACKGROUND, DRAWING, DRAW_SUBMITTED };
+enum draw_state { DRAW_READY, DRAWING, DRAW_SUBMITTED };
 static volatile enum draw_state renderer_state;
 
 // For drawLine
@@ -123,19 +107,6 @@ char textcolor, textbgcolor, wrap;
 #define _width 640
 #define _height 480
 
-// Only the scanout IRQ starts this chain, after both cores have submitted the
-// previous render. The target buffer is therefore no longer read by scanout
-// and is not owned by either renderer. A missed render keeps the old display.
-static void __not_in_flash_func(start_background_restore)(void)
-{
-    start_flag = 0;
-    __dmb(); // Publish the target address before the control DMA reads it.
-    dma_channel_set_read_addr(background_dma_chan, BACKGROUND_SOURCE, false);
-    dma_channel_set_trans_count(background_dma_chan, VGA_DMA_WORDS, false);
-    dma_channel_set_trans_count(set_start_chan, 1, false);
-    dma_channel_set_trans_count(set_draw_chan, 1, true);
-}
-
 static void __not_in_flash_func(vga_frame_irq)(void)
 {
     if (!dma_channel_get_irq1_status(rgb_data_chan)) return;
@@ -145,17 +116,16 @@ static void __not_in_flash_func(vga_frame_irq)(void)
     if (released) {
         uint8_t *old_display = display_buffer;
         display_buffer = (uint8_t *)current_draw_buffer;
-        background_target = old_display;
+        current_draw_buffer = (char *)old_display;
         released_sequence = frame_sequence;
         released_frame_start_us = time_us_32();
-        renderer_state = DRAW_BACKGROUND;
+        __dmb();
+        renderer_state = DRAW_READY;
     }
-    // Restart the pixel stream immediately, independently of the background
-    // copy. Sync PIOs keep running at their fixed cadence. This IRQ runs in
-    // SRAM and has the vertical blanking interval to refill the RGB FIFO.
+    // Sync PIOs keep running at their fixed cadence. This IRQ runs in SRAM and
+    // has the vertical blanking interval to refill the RGB FIFO.
     dma_channel_set_read_addr(rgb_data_chan, display_buffer, false);
     dma_channel_set_trans_count(rgb_data_chan, VGA_DMA_WORDS, true);
-    if (released) start_background_restore();
 }
 
 void initVGA(void)
@@ -172,22 +142,15 @@ void initVGA(void)
     vsync_program_init(pio, vsync_sm, vsync_offset, VSYNC);
     rgb_program_init(rgb_pio, rgb_sm, rgb_offset, LO_GRN);
 
-#if LAB_RAM_BACKGROUND
-    memcpy(vga_background_ram, vga_background_flash, VGA_BUFFER_COUNT);
-#endif
-    memcpy(vga_buffer_0, BACKGROUND_SOURCE, VGA_BUFFER_COUNT);
+    memset(vga_buffer_0, 0, VGA_BUFFER_COUNT);
+    memset(vga_buffer_1, 0, VGA_BUFFER_COUNT);
     display_buffer = vga_buffer_0;
-    background_target = vga_buffer_1;
     current_draw_buffer = (char *)vga_buffer_1;
-    renderer_state = DRAW_BACKGROUND;
+    renderer_state = DRAW_READY;
     frame_sequence = released_sequence = 0;
 
-    // RGB scanout plus an independent draw-target -> background -> start chain.
-    // Four VGA channels in total; the old pointer-table channel is unnecessary.
+    // One DMA channel continuously feeds pixels to the RGB PIO.
     rgb_data_chan = dma_claim_unused_channel(true);
-    set_draw_chan = dma_claim_unused_channel(true);
-    background_dma_chan = dma_claim_unused_channel(true);
-    set_start_chan = dma_claim_unused_channel(true);
 
     dma_channel_config config = dma_channel_get_default_config(rgb_data_chan);
     channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
@@ -197,29 +160,6 @@ void initVGA(void)
     channel_config_set_high_priority(&config, true);
     dma_channel_configure(rgb_data_chan, &config, &rgb_pio->txf[rgb_sm],
                           display_buffer, VGA_DMA_WORDS, false);
-
-    config = dma_channel_get_default_config(set_draw_chan);
-    channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
-    channel_config_set_read_increment(&config, false);
-    channel_config_set_write_increment(&config, false);
-    channel_config_set_chain_to(&config, background_dma_chan);
-    dma_channel_configure(set_draw_chan, &config,
-                          &dma_hw->ch[background_dma_chan].write_addr,
-                          &background_target, 1, false);
-
-    config = dma_channel_get_default_config(background_dma_chan);
-    channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
-    channel_config_set_read_increment(&config, true);
-    channel_config_set_write_increment(&config, true);
-    channel_config_set_chain_to(&config, set_start_chan);
-    dma_channel_configure(background_dma_chan, &config, background_target,
-                          BACKGROUND_SOURCE, VGA_DMA_WORDS, false);
-
-    config = dma_channel_get_default_config(set_start_chan);
-    channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
-    channel_config_set_read_increment(&config, false);
-    channel_config_set_write_increment(&config, false);
-    dma_channel_configure(set_start_chan, &config, &start_flag, &start_value, 1, false);
 
     dma_channel_acknowledge_irq1(rgb_data_chan);
     irq_add_shared_handler(DMA_IRQ_1, vga_frame_irq,
@@ -231,18 +171,9 @@ void initVGA(void)
     pio_sm_put_blocking(pio, vsync_sm, V_ACTIVE);
     pio_sm_put_blocking(rgb_pio, rgb_sm, RGB_ACTIVE);
     released_frame_start_us = time_us_32();
-    start_background_restore();
     dma_start_channel_mask(1u << rgb_data_chan);
     pio_sm_set_enabled(rgb_pio, rgb_sm, true);
     pio_enable_sm_mask_in_sync(pio, (1u << hsync_sm) | (1u << vsync_sm));
-}
-
-// Restoration is automatic before draw_start_signal() grants buffer ownership.
-// Kept as a harmless compatibility call for older animation loops.
-void restoreVgaBackground(void) {}
-int vga_background_ready(void)
-{
-    return renderer_state == DRAWING || start_flag != 0;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -262,26 +193,31 @@ void drawPixel(short x, short y, char color)
     else *pixel &= (uint8_t)~mask;
 }
 
-// Filled radius-four sprite. Each core owns entire rows, never shared bytes.
+// Peg sprites use the configured 6-pixel visual and physical radius.
 void newCircle(short x, short y)
 {
-    mono_stamp_circle((uint8_t *)current_draw_buffer, x, y, 2);
+    mono_stamp_peg((uint8_t *)current_draw_buffer, x, y, 2);
 }
 
 void newCircleRows(short x, short y, unsigned parity)
 {
-    mono_stamp_circle((uint8_t *)current_draw_buffer, x, y, parity & 1u);
+    mono_stamp_peg((uint8_t *)current_draw_buffer, x, y, parity & 1u);
 }
 
 void referenceCircleRows(short x, short y, unsigned parity)
 {
-    mono_reference_circle((uint8_t *)current_draw_buffer, x, y, parity & 1u);
+    mono_reference_peg((uint8_t *)current_draw_buffer, x, y, parity & 1u);
 }
 
-// Legacy ball entry point now uses the requested filled stamp.
+// Ball sprites are drawn smaller than their physical collision radius.
 void drawWhiteBallRows(short x, short y, unsigned parity)
 {
-    newCircleRows(x, y, parity);
+    mono_stamp_ball_outline((uint8_t *)current_draw_buffer, x, y, parity & 1u);
+}
+
+void referenceWhiteBallRows(short x, short y, unsigned parity)
+{
+    mono_reference_ball_outline((uint8_t *)current_draw_buffer, x, y, parity & 1u);
 }
 
 // Check status of neighbors
@@ -1082,13 +1018,11 @@ void clearRegion(short y1, short y2, short c)
 int draw_start_signal(void)
 {
     uint32_t irq_state = save_and_disable_interrupts();
-    bool ready = renderer_state == DRAW_BACKGROUND && start_flag != 0;
+    bool ready = renderer_state == DRAW_READY;
     if (ready) {
-        __dmb(); // Observe the complete DMA copy before either renderer writes.
+        __dmb();
         drawing_sequence = released_sequence;
         drawing_frame_start_us = released_frame_start_us;
-        current_draw_buffer = (char *)background_target;
-        start_flag = 0;
         renderer_state = DRAWING;
     }
     restore_interrupts(irq_state);

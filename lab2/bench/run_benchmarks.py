@@ -19,8 +19,6 @@ VARIANTS = {
     "full_scan": "Without spatial filtering",
     "single_core": "Without second worker core",
     "pixel_stamps": "Without packed circle stamps",
-    "ram_background": "Without flash background",
-    "general_damping": "Without shift damping",
     "reference_normal": "Without fast root / normal",
     "no_draw_cache": "Without duplicate draw cache",
     "no_text_cache": "Without text format cache",
@@ -45,6 +43,7 @@ def build(args):
         subprocess.run([cmake, "-S", str(ROOT), "-B", str(directory), "-G", "Ninja",
                         f"-DCMAKE_MAKE_PROGRAM={ninja}", "-DCMAKE_BUILD_TYPE=Release",
                         "-DPICO_BOARD=pico2", f"-DLAB_BENCH_VARIANT={variant}",
+                        "-DLAB_CAPACITY_CALIBRATION=ON",
                         f"-DLAB_CALIBRATION_WARMUP_FRAMES={args.warmup}",
                         f"-DLAB_CALIBRATION_FRAMES={args.frames}"], check=True)
         subprocess.run([cmake, "--build", str(directory), "-j", str(args.jobs)], check=True)

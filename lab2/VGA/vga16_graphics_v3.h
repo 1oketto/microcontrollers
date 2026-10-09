@@ -20,8 +20,8 @@
  *
  * RESOURCES USED
  *  - PIO0 state machines 0/1 for sync; PIO1 state machine 0 for pixels
- *  - 4 DMA channels including background restoration
- *  - 2 x 38.4 KB SRAM framebuffers plus a 38.4 KB static scene in flash
+ *  - 1 DMA channel for RGB pixel scanout
+ *  - 2 x 38.4 KB SRAM framebuffers
  *
  */
 
@@ -43,14 +43,8 @@ int isAlive(short x, short y) ;
 
 // VGA init -- Do this before any other libraries
 void initVGA(void) ;
-// The immutable static scene is generated offline into XIP flash.
-// Restored automatically by DMA before draw_start_signal grants ownership.
-void restoreVgaBackground(void);
-int vga_background_ready(void);
-
 // ========================
-// sync signals from DMA channel to thread
-// signal to thread to draw
+// Acquire the next writable framebuffer.
 int draw_start_signal(void);
 // Submit only after both renderer cores and UI finish; acquires the next frame separately.
 void vga_frame_complete(void);
@@ -63,13 +57,16 @@ int get_buffer_type(void) ;
 // =========================
 // shapes and fills
 void drawPixel(short x, short y, char color) ;
-// Precomputed radius-four filled white circle (9 x 9 sprite).
+// Precomputed filled peg sprite using BOARD_PEG_RADIUS.
 void newCircle(short x, short y);
 // Concurrency: opposite SCREEN-row parities own disjoint framebuffer bytes.
 void newCircleRows(short x, short y, unsigned parity);
 // Generic midpoint ablation with the same filled raster and parity ownership.
 void referenceCircleRows(short x, short y, unsigned parity);
+// Draw a hollow radius-four white ball, with parity ownership for dual-core rendering.
 void drawWhiteBallRows(short x, short y, unsigned parity);
+// Generic midpoint outline used by the LAB_GENERIC_CIRCLE ablation.
+void referenceWhiteBallRows(short x, short y, unsigned parity);
 void drawVLine(short x, short y, short h, char color) ;
 void drawHLine(int x, int y, int w, char color) ; // faster mod 5/11/2025
 void drawLine(short x0, short y0, short x1, short y1, char color) ;

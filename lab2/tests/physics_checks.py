@@ -2,7 +2,7 @@
 """Compile the production physics helpers on the host and check against references.
 
 No Pico SDK, display, or timing claims are involved. The actual updateboid body is
-compiled twice: optimized and exhaustive 136-peg/reference-normal/general-damping.
+compiled twice: optimized and exhaustive 136-peg/reference-normal.
 """
 
 from pathlib import Path
@@ -42,14 +42,13 @@ preamble = """
 #include <math.h>
 #include <string.h>
 #include "board_config.h"
-#define BOUNCE_OFF_SHIFT 31u
 """
 preamble += section("typedef signed int fix15;", "static fix15 peg_x")
 preamble += "static fix15 peg_x[PEG_COUNT], peg_y[PEG_COUNT];\n"
 preamble += "#define HISTOGRAM_BINS (PEG_ROWS - 1)\n"
-preamble += section("typedef struct\n{\n    int16_t x, y;", "static boid boids[")
+preamble += section("typedef struct\n{\n    int16_t x, y;", "static boid *boids;")
 preamble += section("typedef struct {\n    uint32_t rng;", "static physics_state physics[")
-for name in ("initPegs", "packFixed", "nextRandom", "dropboid", "bouncinessShift", "collisionClearance"):
+for name in ("initPegs", "packFixed", "nextRandom", "dropboid", "collisionClearance"):
     preamble += function(name)
 
 body = "".join(function(name) for name in ("distanceFix15", "normalComponent", "dampVelocity", "updateboid"))
@@ -57,10 +56,8 @@ production = "#define updateboid updateboid_optimized\n" + body + "#undef update
 reference = """
 #undef LAB_FULL_PEG_SCAN
 #undef LAB_REFERENCE_NORMAL
-#undef LAB_GENERAL_DAMPING
 #define LAB_FULL_PEG_SCAN 1
 #define LAB_REFERENCE_NORMAL 1
-#define LAB_GENERAL_DAMPING 1
 #define distanceFix15 distanceFix15_reference
 #define normalComponent normalComponent_reference
 #define dampVelocity dampVelocity_reference
@@ -78,11 +75,11 @@ static int sample(int low, int high) {
     return low + (int)(nextRandom(&rng) % (unsigned)(high - low + 1));
 }
 
-static void compareBall(boid input, unsigned shift) {
+static void compareBall(boid input, fix15 bounciness) {
     boid a = input, b = input;
     physics_state sa = {.rng = 19}, sb = {.rng = 19};
-    updateboid_optimized(&a, &sa, shift);
-    updateboid_reference(&b, &sb, shift);
+    updateboid_optimized(&a, &sa, bounciness);
+    updateboid_reference(&b, &sb, bounciness);
     assert(a.x == b.x && a.y == b.y && a.vx == b.vx && a.vy == b.vy);
     assert(a.last_peg == b.last_peg && a.histogram_recorded == b.histogram_recorded);
     assert(sa.rng == sb.rng && sa.collisions == sb.collisions && sa.fallen == sb.fallen);
@@ -91,22 +88,50 @@ static void compareBall(boid input, unsigned shift) {
 
 int main(void) {
     initPegs();
-    const unsigned shifts[] = {BOUNCE_OFF_SHIFT, 4, 3, 2, 1, 0};
-    const fix15 coefficients[] = {0, 2048, 4096, 8192, 16384, 32768};
-    for (unsigned j = 0; j < 6; ++j) assert(bouncinessShift(coefficients[j]) == shifts[j]);
-    const int32_t edges[] = {INT32_MIN, INT32_MIN + 1, -65537, -32769, -1,
-                            0, 1, 32769, 65537, INT32_MAX};
-    for (unsigned i = 0; i < sizeof(edges) / sizeof(edges[0]); ++i)
-        for (unsigned shift = 0; shift < 32; ++shift)
-            assert(shiftRightTrunc32(edges[i], shift) ==
-                   (int64_t)edges[i] / (INT64_C(1) << shift));
+    const fix15 coefficients[] = {0, 3277, 6554, 9830, 13107, 16384,
+                                  19661, 22938, 26214, 29491, 32768};
+    physics_state distribution = {.rng = 0x6d2b79f5u};
+    uint32_t distribution_spawn_rng = 0x1b873593u;
+    for (unsigned sample_index = 0; sample_index < 16384; ++sample_index) {
+        boid sample_ball;
+        dropboid(&sample_ball, &distribution_spawn_rng);
+        for (unsigned frame = 0; frame < 1000 && !sample_ball.histogram_recorded; ++frame)
+            updateboid_optimized(&sample_ball, &distribution, coefficients[5]);
+        assert(sample_ball.histogram_recorded);
+    }
+    int histogram_total = 0;
+    uint64_t mirror_difference = 0;
+    for (int bin = 0; bin < HISTOGRAM_BINS; ++bin) {
+        histogram_total += distribution.histogram[bin];
+        if (bin < HISTOGRAM_BINS / 2)
+            mirror_difference += (uint64_t)abs(distribution.histogram[bin] -
+                                      distribution.histogram[HISTOGRAM_BINS - 1 - bin]);
+        if (bin < HISTOGRAM_BINS / 2)
+            assert(distribution.histogram[bin] <= distribution.histogram[bin + 1]);
+        else if (bin > HISTOGRAM_BINS / 2)
+            assert(distribution.histogram[bin - 1] >= distribution.histogram[bin]);
+    }
+    assert(histogram_total >= 16384 * 8 / 10);
+    assert(mirror_difference * 10 <= (uint64_t)histogram_total);
+
+    boid separated_ball = {
+        .x = packFixed(peg_x[0], 10),
+        .y = packFixed(peg_y[0] -
+                       int2fix15(BOARD_BALL_RADIUS + BOARD_PEG_RADIUS + 1), 10),
+        .vx = 0, .vy = 512, .last_peg = 0
+    };
+    physics_state separated_state = {.rng = 19};
+    updateboid_optimized(&separated_ball, &separated_state, coefficients[5]);
+    assert(separated_ball.last_peg == NO_PEG);
 
     for (unsigned i = 0; i < 200000; ++i) {
         fix15 a = sample(-1048576, 1048576), b = sample(-32768, 32768);
         assert(multfix15(a, b) == (int64_t)a * b / 32768);
-        assert(collisionClearance(b) == b * 9);
-        for (unsigned j = 0; j < 6; ++j)
-            assert(dampVelocity(a, shifts[j]) == (int64_t)a * coefficients[j] / 32768);
+        assert(collisionClearance(b) ==
+               b * (BOARD_BALL_RADIUS + BOARD_PEG_RADIUS + 1));
+        for (unsigned j = 0; j < sizeof(coefficients) / sizeof(coefficients[0]); ++j)
+            assert(dampVelocity(a, coefficients[j]) ==
+                   (int64_t)a * coefficients[j] / 32768);
         fix15 dx = sample(-262143, 262143), dy = sample(-262143, 262143);
         fix15 dist = distanceFix15(dx, dy);
         assert(dist == distanceFix15_reference(dx, dy));
@@ -125,7 +150,8 @@ int main(void) {
                 boid ball = {.x = packFixed(peg_x[peg] + int2fix15(dx), 10),
                              .y = packFixed(peg_y[peg] + int2fix15(dy), 10),
                              .vx = 0, .vy = 0, .last_peg = NO_PEG};
-                compareBall(ball, shifts[(unsigned)(dx + dy + 18) % 6]);
+                compareBall(ball, coefficients[(unsigned)(dx + dy + 18) %
+                            (sizeof(coefficients) / sizeof(coefficients[0]))]);
             }
 
     // Large signed velocities, screen exit/respawn and histogram boundaries.
@@ -136,27 +162,27 @@ int main(void) {
                      .vy = (int16_t)sample(INT16_MIN, INT16_MAX),
                      .last_peg = (uint8_t)sample(0, UINT8_MAX),
                      .histogram_recorded = (nextRandom(&rng) & 1u) != 0};
-        compareBall(ball, shifts[i % 6]);
+        compareBall(ball, coefficients[i % (sizeof(coefficients) / sizeof(coefficients[0]))]);
     }
 
     // Sustained trajectories accumulate state over many frames. Divergence can
     // reveal a missed later collision that a one-frame random sample misses.
-    for (unsigned j = 0; j < 6; ++j) {
+    for (unsigned j = 0; j < sizeof(coefficients) / sizeof(coefficients[0]); ++j) {
         physics_state sa = {.rng = 117}, sb = {.rng = 117};
         boid a, b;
         uint32_t spawn = 3;
         dropboid(&a, &spawn);
         b = a;
         for (unsigned frame = 0; frame < 20000; ++frame) {
-            updateboid_optimized(&a, &sa, shifts[j]);
-            updateboid_reference(&b, &sb, shifts[j]);
+            updateboid_optimized(&a, &sa, coefficients[j]);
+            updateboid_reference(&b, &sb, coefficients[j]);
             assert(a.x == b.x && a.y == b.y && a.vx == b.vx && a.vy == b.vy);
             assert(a.last_peg == b.last_peg && a.histogram_recorded == b.histogram_recorded);
             assert(sa.rng == sb.rng && sa.collisions == sb.collisions && sa.fallen == sb.fallen);
             assert(memcmp(sa.histogram, sb.histogram, sizeof(sa.histogram)) == 0);
         }
     }
-    puts("PASS: signed shifts/damping; 200000 exact roots/normals; 369096 broad-phase/reference updates");
+    puts("PASS: variable damping; 200000 exact roots/normals; broad-phase/reference updates");
 }
 """
 
