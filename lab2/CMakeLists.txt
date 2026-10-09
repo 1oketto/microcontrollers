@@ -34,7 +34,7 @@ target_compile_options(VGA_Animation_Demo PRIVATE -O3)
 # the final build, not cumulative speedups and not substitutes for old firmware.
 set(LAB_BENCH_VARIANT "full" CACHE STRING "Benchmark variant")
 set_property(CACHE LAB_BENCH_VARIANT PROPERTY STRINGS full full_scan single_core pixel_stamps reference_normal no_draw_cache no_text_cache)
-set(LAB_INITIAL_BALL_COUNT 20000 CACHE STRING "Initial number of balls")
+set(LAB_INITIAL_BALL_COUNT 25000 CACHE STRING "Initial number of balls")
 if(NOT LAB_INITIAL_BALL_COUNT MATCHES "^[0-9]+$")
     message(FATAL_ERROR "LAB_INITIAL_BALL_COUNT must be a non-negative integer")
 endif()

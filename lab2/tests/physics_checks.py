@@ -133,6 +133,20 @@ int main(void) {
                          &separated_state, coefficients[5]);
     assert(separated_ball_state == NO_PEG);
 
+    boid recorded_ball = {.x = 1234, .y = 12000, .vx = -456, .vy = 640};
+    uint8_t recorded_ball_state = HISTOGRAM_RECORDED;
+    physics_state recorded_state = {.rng = 23};
+    fix15 expected_recorded_y = (fix15)recorded_ball.y * 1024 +
+                                (fix15)recorded_ball.vy * 32;
+    fix15 expected_recorded_vy = (fix15)recorded_ball.vy * 32 + GRAVITY;
+    updateboid_optimized(&recorded_ball, &recorded_ball_state,
+                         &recorded_state, coefficients[5]);
+    assert(recorded_ball.x == 1234 && recorded_ball.vx == -456);
+    assert(recorded_ball.y == packFixed(expected_recorded_y, 10));
+    assert(recorded_ball.vy == packFixed(expected_recorded_vy, 5));
+    assert(recorded_ball_state == HISTOGRAM_RECORDED);
+    assert(recorded_state.fallen == 0 && recorded_state.rng == 23);
+
     for (unsigned i = 0; i < 200000; ++i) {
         fix15 a = sample(-1048576, 1048576), b = sample(-32768, 32768);
         assert(multfix15(a, b) == (int64_t)a * b / 32768);

@@ -89,7 +89,7 @@ static uint32_t peg_sound_events = 0; // how many collisions have happened
 #define LAB_CALIBRATION_FRAMES 600u
 #endif
 #ifndef LAB_INITIAL_BALL_COUNT
-#define LAB_INITIAL_BALL_COUNT 24000
+#define LAB_INITIAL_BALL_COUNT 25000
 #endif
 #ifndef LAB_CAPACITY_CALIBRATION
 #define LAB_CAPACITY_CALIBRATION 0
@@ -110,19 +110,19 @@ static uint32_t peg_sound_events = 0; // how many collisions have happened
 #define LAB_COLLISION_PROFILE 0
 #endif
 _Static_assert(LAB_CALIBRATION_FRAMES > 0, "A trial must time at least one frame");
-#define ROTARY_BALL_STEP 100
+#define ROTARY_BALL_STEP 10
 _Static_assert(LAB_INITIAL_BALL_COUNT >= 0, "Initial ball count cannot be negative");
 _Static_assert(LAB_INITIAL_BALL_COUNT <= INT_MAX, "Initial ball count exceeds the supported count type");
 #if LAB_CAPACITY_CALIBRATION
-#define CALIBRATION_MAX_BALLS 30000
 static volatile bool calibrating = true;
 static int calibration_good = -1; // No untested count is assumed to pass.
-static int calibration_bad = CALIBRATION_MAX_BALLS + 1;
+static int calibration_bad = INT_MAX;
 static unsigned calibration_frames = 0;
 static unsigned calibration_warmup = 0;
 static uint64_t calibration_total_us = 0;
 static uint32_t calibration_max_us = 0;
-static int calibration_target = CALIBRATION_MAX_BALLS;
+static int calibration_target = LAB_INITIAL_BALL_COUNT > 0
+    ? LAB_INITIAL_BALL_COUNT : 1;
 #else
 static volatile bool calibrating = false;
 #endif
@@ -440,6 +440,12 @@ static void startCalibrationTrial(int count)
     calibration_target = count;
     rotary_count = count;
     syncboidCount();
+    if (boid_count != count) {
+        printf("CAPACITY_MEMORY_LIMIT,%s,%d,%d\n",
+               LAB_BENCH_VARIANT, count, boid_count);
+        calibrating = false;
+        return;
+    }
     spawn_rng = 3;
     physics[0].rng = 1;
     physics[1].rng = 2;
@@ -476,7 +482,8 @@ static void finishCalibrationFrame(bool missed_deadline, uint32_t elapsed_us)
     if (missed_deadline) calibration_bad = calibration_target;
     else calibration_good = calibration_target;
 
-    if (calibration_bad - calibration_good <= 1) {
+    if (calibration_bad != INT_MAX &&
+        (int64_t)calibration_bad - calibration_good <= 1) {
         rotary_count = calibration_good < 0 ? 0 : calibration_good;
         syncboidCount();
         spawn_rng = time_us_32() | 1u;
@@ -490,13 +497,28 @@ static void finishCalibrationFrame(bool missed_deadline, uint32_t elapsed_us)
         calibrating = false;
         if (calibration_good >= 0)
             printf("CAPACITY,%s,%d,%d,%u\n", LAB_BENCH_VARIANT,
-                   calibration_good, CALIBRATION_MAX_BALLS,
-                   calibration_good == CALIBRATION_MAX_BALLS);
+                   calibration_good, calibration_bad, 0u);
         else
             printf("BENCH_ERROR,%s,even_zero_balls_missed_deadline\n", LAB_BENCH_VARIANT);
         return;
     }
-    int next = calibration_good + (calibration_bad - calibration_good) / 2;
+    int next;
+    if (calibration_bad == INT_MAX) {
+        if (calibration_target == INT_MAX) {
+            rotary_count = calibration_target;
+            calibrating = false;
+            printf("CAPACITY,%s,%d,0,0\n",
+                   LAB_BENCH_VARIANT, calibration_target);
+            return;
+        }
+        next = calibration_target > INT_MAX / 2
+            ? INT_MAX : calibration_target * 2;
+    } else {
+        next = calibration_good < 0
+            ? calibration_bad / 2
+            : calibration_good + (int)(((int64_t)calibration_bad -
+                                        calibration_good) / 2);
+    }
     startCalibrationTrial(next);
 }
 #endif
@@ -562,13 +584,25 @@ static inline fix15 collisionClearance(fix15 normal)
 static void updateboid(boid *ball, uint8_t *ball_state,
                        physics_state *state, fix15 bounciness)
 {
+    if (*ball_state == HISTOGRAM_RECORDED) {
+        fix15 y = (fix15)ball->y * 1024 + (fix15)ball->vy * 32;
+        if (y > int2fix15(480 + boid_RADIUS)) {
+            ++state->fallen;
+            dropboid(ball, ball_state, &state->rng);
+            return;
+        }
+        fix15 vy = (fix15)ball->vy * 32 + GRAVITY;
+        ball->y = packFixed(y, 10);
+        ball->vy = packFixed(vy, 5);
+        return;
+    }
+
     const int radius = boid_RADIUS + PEG_RADIUS;
     const fix15 collision_distance = int2fix15(radius);
-    bool histogram_recorded = *ball_state == HISTOGRAM_RECORDED;
-    if (!histogram_recorded && *ball_state != NO_PEG &&
+    if (*ball_state != NO_PEG &&
         *ball_state >= PEG_COUNT) {
         *ball_state = NO_PEG;
-    } else if (!histogram_recorded && *ball_state != NO_PEG) {
+    } else if (*ball_state != NO_PEG) {
         fix15 previous_dx = (fix15)ball->x * 1024 - peg_x[*ball_state];
         fix15 previous_dy = (fix15)ball->y * 1024 - peg_y[*ball_state];
         int64_t previous_distance_squared = (int64_t)previous_dx * previous_dx +
@@ -592,7 +626,7 @@ static void updateboid(boid *ball, uint8_t *ball_state,
 #endif
     // A recorded ball has already cleared the bottom contact boundary; its
     // later motion cannot change its histogram bin.
-    for (int row = first_row; !histogram_recorded && row < PEG_ROWS; ++row)
+    for (int row = first_row; row < PEG_ROWS; ++row)
     {
 #if LAB_COLLISION_PROFILE
         ++state->peg_rows_checked;
@@ -671,8 +705,7 @@ static void updateboid(boid *ball, uint8_t *ball_state,
     // Record the gap as soon as the boid clears the bottom row.
     // Waiting until the screen edge lets horizontal drift change the bin.
     const fix15 bottom_row_y = PEG_Y + int2fix15((PEG_ROWS - 1) * PEG_VERTICAL_SPACING);
-    if (!histogram_recorded &&
-        y > bottom_row_y + int2fix15(PEG_RADIUS + boid_RADIUS))
+    if (y > bottom_row_y + int2fix15(PEG_RADIUS + boid_RADIUS))
     {
         const fix15 first_peg_x =
             PEG_X - int2fix15((PEG_ROWS - 1) * PEG_HORIZONTAL_SPACING) / 2;
@@ -775,6 +808,11 @@ static void drawBallRows(unsigned parity)
         int y = boids[i].y >> 5;
         if (x >= -BOARD_BALL_DRAW_RADIUS && x <= 639 + BOARD_BALL_DRAW_RADIUS &&
             y >= -BOARD_BALL_DRAW_RADIUS && y <= 479 + BOARD_BALL_DRAW_RADIUS) {
+#if BOARD_BALL_DRAW_RADIUS == 0
+            // A one-pixel sprite touches only its center scanline, so the
+            // other core can skip its cache and stamp work entirely.
+            if (((unsigned)y & 1u) != parity) continue;
+#endif
 #if !LAB_NO_DRAW_CACHE
             uint32_t key = ((uint32_t)(y + BOARD_BALL_DRAW_RADIUS) << 10) |
                            (uint32_t)(x + BOARD_BALL_DRAW_RADIUS);
@@ -963,7 +1001,7 @@ static PT_THREAD(protothread_anim(struct pt *pt))
 int main()
 {
     // Core DVDD, NOT the 3.3 V I/O rail. Keep the SDK voltage limit enabled.
-    // Keep the known-good 300 MHz board clock; 400 MHz caused VGA instability.
+    // Use the known-good clock; the 400 MHz configuration lost VGA sync.
     vreg_set_voltage(VREG_VOLTAGE_1_30);
     sleep_ms(10);
     set_sys_clock_khz(300000, true);
@@ -1052,9 +1090,11 @@ int main()
     channel_config_set_transfer_data_size(&c2, DMA_SIZE_16);           // 16-bit txfers
     channel_config_set_read_increment(&c2, true);                      // yes read incrementing
     channel_config_set_write_increment(&c2, false);                    // no write incrementing
-    // Timer rate = sys_clk * X/Y: approximately 44,000 samples/s at 300 MHz.
+    // Timer rate = sys_clk * X/Y: approximately 44,000 samples/s.
     int audio_timer = dma_claim_unused_timer(true);
-    dma_timer_set_fraction(audio_timer, 5, 34091);
+    uint32_t audio_timer_denominator =
+        (uint32_t)(((uint64_t)clock_get_hz(clk_sys) * 5u + 22000u) / 44000u);
+    dma_timer_set_fraction(audio_timer, 5, audio_timer_denominator);
     channel_config_set_dreq(&c2, dma_get_timer_dreq(audio_timer));
     // chain back to data channel because unlike the demo we don't want it to keep looping
     channel_config_set_chain_to(&c2, data_chan);
