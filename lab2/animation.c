@@ -89,7 +89,7 @@ static uint32_t peg_sound_events = 0; // how many collisions have happened
 #define LAB_CALIBRATION_FRAMES 600u
 #endif
 #ifndef LAB_INITIAL_BALL_COUNT
-#define LAB_INITIAL_BALL_COUNT 20000
+#define LAB_INITIAL_BALL_COUNT 24000
 #endif
 #ifndef LAB_CAPACITY_CALIBRATION
 #define LAB_CAPACITY_CALIBRATION 0
@@ -106,12 +106,15 @@ static uint32_t peg_sound_events = 0; // how many collisions have happened
 #ifndef LAB_NO_TEXT_CACHE
 #define LAB_NO_TEXT_CACHE 0
 #endif
+#ifndef LAB_COLLISION_PROFILE
+#define LAB_COLLISION_PROFILE 0
+#endif
 _Static_assert(LAB_CALIBRATION_FRAMES > 0, "A trial must time at least one frame");
-#define ROTARY_BALL_STEP 500
+#define ROTARY_BALL_STEP 100
 _Static_assert(LAB_INITIAL_BALL_COUNT >= 0, "Initial ball count cannot be negative");
 _Static_assert(LAB_INITIAL_BALL_COUNT <= INT_MAX, "Initial ball count exceeds the supported count type");
 #if LAB_CAPACITY_CALIBRATION
-#define CALIBRATION_MAX_BALLS 20000
+#define CALIBRATION_MAX_BALLS 30000
 static volatile bool calibrating = true;
 static int calibration_good = -1; // No untested count is assumed to pass.
 static int calibration_bad = CALIBRATION_MAX_BALLS + 1;
@@ -300,19 +303,24 @@ static void initPegs(void)
     }
 }
 
-// Compact storage: positions have 1/32-pixel precision, velocities 1/1024.
-// Collision calculations still use Q15 intermediates. Signed positions allow
-// balls to leave the screen; 32 pixels/frame covers normal Galton-board speeds.
+// Coordinates remain word-aligned; one state byte per ball is kept in a sidecar.
+// Positions have 1/32-pixel precision and velocities 1/1024. Signed positions
+// allow screen exits; 32 pixels/frame covers normal Galton-board speeds.
 typedef struct
 {
     int16_t x, y;   // Q5, range -1024 to just below 1024 pixels.
     int16_t vx, vy; // Q10, range -32 to just below 32 pixels/frame.
-    uint8_t last_peg; // 0..135, or NO_PEG before the first impact.
-    bool histogram_recorded;
 } boid;
 #define NO_PEG UINT8_MAX
-_Static_assert(sizeof(boid) == 10, "Ball storage must remain compact");
+#define HISTOGRAM_RECORDED (UINT8_MAX - 1)
+_Static_assert(PEG_COUNT < HISTOGRAM_RECORDED,
+               "Peg indices must not overlap boid state sentinels");
+_Static_assert(sizeof(boid) == 8, "Ball coordinates must stay word-aligned");
 static boid *boids;
+// The state sidecar makes the allocation exactly 9 bytes per ball without
+// forcing unaligned coordinate loads from a packed 9-byte struct.
+static uint8_t *boid_state;
+static void *boid_pool;
 static int boid_capacity;
 static int boid_count = 0;
 
@@ -333,6 +341,11 @@ typedef struct {
     uint32_t rng;
     uint32_t collisions;
     uint32_t fallen;
+#if LAB_COLLISION_PROFILE
+    uint32_t peg_rows_checked;
+    uint32_t peg_candidates;
+    uint32_t distance_checks;
+#endif
     int histogram[HISTOGRAM_BINS];
 } physics_state;
 static physics_state physics[2] = {{.rng = 1}, {.rng = 2}};
@@ -341,6 +354,12 @@ static semaphore_t physics_start, physics_done;
 static int worker_begin, worker_end;
 static fix15 frame_bounciness;
 static bool worker_draw;
+#if LAB_COLLISION_PROFILE
+static uint64_t profile_peg_rows_checked;
+static uint64_t profile_peg_candidates;
+static uint64_t profile_distance_checks;
+static unsigned profile_frames;
+#endif
 
 static uint32_t nextRandom(uint32_t *state)
 {
@@ -352,7 +371,7 @@ static uint32_t nextRandom(uint32_t *state)
     return value;
 }
 
-static void dropboid(boid *ball, uint32_t *rng)
+static void dropboid(boid *ball, uint8_t *state, uint32_t *rng)
 {
     ball->x = packFixed(PEG_X, 10);
     ball->y = boid_RADIUS * 32;
@@ -361,8 +380,7 @@ static void dropboid(boid *ball, uint32_t *rng)
     if (nextRandom(rng) & 1u) vx = -vx;
     ball->vx = packFixed(vx, 5);
     ball->vy = 0;
-    ball->last_peg = NO_PEG;
-    ball->histogram_recorded = false;
+    *state = NO_PEG;
 }
 
 // Resize only between worker jobs so neither core can retain a stale ball pointer.
@@ -371,9 +389,10 @@ static void syncboidCount(void)
     int requested = rotary_count;
     if (requested < 0) requested = 0;
     if (requested > boid_capacity) {
-        boid *resized = NULL;
-        if ((size_t)requested <= SIZE_MAX / sizeof(*boids))
-            resized = realloc(boids, (size_t)requested * sizeof(*boids));
+        void *resized = NULL;
+        const size_t bytes_per_ball = sizeof(*boids) + sizeof(*boid_state);
+        if ((size_t)requested <= SIZE_MAX / bytes_per_ball)
+            resized = realloc(boid_pool, (size_t)requested * bytes_per_ball);
         if (resized == NULL) {
             ball_allocation_failed = true;
             uint32_t irq_state = save_and_disable_interrupts();
@@ -382,13 +401,21 @@ static void syncboidCount(void)
             restore_interrupts(irq_state);
             requested = boid_capacity;
         } else {
+            size_t old_state_offset = (size_t)boid_capacity * sizeof(*boids);
+            size_t new_state_offset = (size_t)requested * sizeof(*boids);
+            if (boid_capacity > 0)
+                memmove((uint8_t *)resized + new_state_offset,
+                        (uint8_t *)resized + old_state_offset,
+                        (size_t)boid_capacity * sizeof(*boid_state));
+            boid_pool = resized;
             boids = resized;
+            boid_state = (uint8_t *)resized + new_state_offset;
             boid_capacity = requested;
             ball_allocation_failed = false;
         }
     }
     for (int i = boid_count; i < requested; ++i)
-        dropboid(&boids[i], &spawn_rng);
+        dropboid(&boids[i], &boid_state[i], &spawn_rng);
     boid_count = requested;
 }
 
@@ -417,7 +444,7 @@ static void startCalibrationTrial(int count)
     physics[0].rng = 1;
     physics[1].rng = 2;
     for (int i = 0; i < boid_count; ++i)
-        dropboid(&boids[i], &spawn_rng);
+        dropboid(&boids[i], &boid_state[i], &spawn_rng);
     memset(histogram, 0, sizeof(histogram));
     total_fallen = 0;
     calibration_frames = 0;
@@ -456,7 +483,8 @@ static void finishCalibrationFrame(bool missed_deadline, uint32_t elapsed_us)
         physics[0].rng = spawn_rng;
         physics[1].rng = spawn_rng ^ 0x9e3779b9u;
         if (physics[1].rng == 0) physics[1].rng = 2;
-        for (int i = 0; i < boid_count; ++i) dropboid(&boids[i], &spawn_rng);
+        for (int i = 0; i < boid_count; ++i)
+            dropboid(&boids[i], &boid_state[i], &spawn_rng);
         memset(histogram, 0, sizeof(histogram));
         total_fallen = 0;
         calibrating = false;
@@ -531,19 +559,22 @@ static inline fix15 collisionClearance(fix15 normal)
     return normal < 0 ? -offset : offset;
 }
 
-static void updateboid(boid *ball, physics_state *state, fix15 bounciness)
+static void updateboid(boid *ball, uint8_t *ball_state,
+                       physics_state *state, fix15 bounciness)
 {
     const int radius = boid_RADIUS + PEG_RADIUS;
     const fix15 collision_distance = int2fix15(radius);
-    if (ball->last_peg != NO_PEG && ball->last_peg >= PEG_COUNT) {
-        ball->last_peg = NO_PEG;
-    } else if (ball->last_peg != NO_PEG) {
-        fix15 previous_dx = (fix15)ball->x * 1024 - peg_x[ball->last_peg];
-        fix15 previous_dy = (fix15)ball->y * 1024 - peg_y[ball->last_peg];
+    bool histogram_recorded = *ball_state == HISTOGRAM_RECORDED;
+    if (!histogram_recorded && *ball_state != NO_PEG &&
+        *ball_state >= PEG_COUNT) {
+        *ball_state = NO_PEG;
+    } else if (!histogram_recorded && *ball_state != NO_PEG) {
+        fix15 previous_dx = (fix15)ball->x * 1024 - peg_x[*ball_state];
+        fix15 previous_dy = (fix15)ball->y * 1024 - peg_y[*ball_state];
         int64_t previous_distance_squared = (int64_t)previous_dx * previous_dx +
                                             (int64_t)previous_dy * previous_dy;
         if (previous_distance_squared >= (int64_t)collision_distance * collision_distance)
-            ball->last_peg = NO_PEG;
+            *ball_state = NO_PEG;
     }
 
     fix15 vx = (fix15)ball->vx * 32;
@@ -559,11 +590,13 @@ static void updateboid(boid *ball, physics_state *state, fix15 bounciness)
     int first_row = (fix2int15(y) - fix2int15(PEG_Y) - radius) / PEG_VERTICAL_SPACING;
     if (first_row < 0) first_row = 0;
 #endif
-    // Once recorded below the bottom row while moving down, a ball cannot
-    // reach another peg. Keep checking if it is moving upward after a bounce.
-    bool can_reach_peg_rows = !ball->histogram_recorded || vy < 0;
-    if (can_reach_peg_rows) for (int row = first_row; row < PEG_ROWS; ++row)
+    // A recorded ball has already cleared the bottom contact boundary; its
+    // later motion cannot change its histogram bin.
+    for (int row = first_row; !histogram_recorded && row < PEG_ROWS; ++row)
     {
+#if LAB_COLLISION_PROFILE
+        ++state->peg_rows_checked;
+#endif
         int row_start = (row * (row + 1)) >> 1;
 #if LAB_FULL_PEG_SCAN
         int first_col = 0;
@@ -571,6 +604,7 @@ static void updateboid(boid *ball, physics_state *state, fix15 bounciness)
 #else
         fix15 row_dy = y - peg_y[row_start];
         if (row_dy <= -int2fix15(radius)) break;
+        if (row_dy >= int2fix15(radius + PEG_VERTICAL_SPACING)) break;
         if (row_dy >= int2fix15(radius)) continue;
         // Peg centers in a row are 38 pixels apart, while the contact
         // diameter is only 20 pixels, so at most the nearest peg can overlap.
@@ -587,10 +621,16 @@ static void updateboid(boid *ball, physics_state *state, fix15 bounciness)
 #if !LAB_FULL_PEG_SCAN
             if (peg_x[peg] - x >= int2fix15(radius)) continue;
 #endif
+#if LAB_COLLISION_PROFILE
+            ++state->peg_candidates;
+#endif
             fix15 dx = x - peg_x[peg];
             fix15 dy = y - peg_y[peg];
             if (absfix15(dx) < collision_distance && absfix15(dy) < collision_distance)
             {
+#if LAB_COLLISION_PROFILE
+                ++state->distance_checks;
+#endif
                 int64_t distance_squared = (int64_t)dx * dx + (int64_t)dy * dy;
                 if (distance_squared < (int64_t)collision_distance * collision_distance)
                 {
@@ -612,7 +652,7 @@ static void updateboid(boid *ball, physics_state *state, fix15 bounciness)
                         vx += multfix15(normal_x, intermediate_term);
                         vy += multfix15(normal_y, intermediate_term);
                         // Sound and damping only when this boid hits a different peg.
-                        if (ball->last_peg != peg)
+                        if (*ball_state != peg)
                         {
                             ++state->collisions;
                             vx = dampVelocity(vx, bounciness);
@@ -620,7 +660,7 @@ static void updateboid(boid *ball, physics_state *state, fix15 bounciness)
                             vx += (nextRandom(&state->rng) & 0x80000000u)
                                 ? RANDOM_LATERAL_KICK_Q15
                                 : -RANDOM_LATERAL_KICK_Q15;
-                            ball->last_peg = peg;
+                            *ball_state = (uint8_t)peg;
                         }
                     }
                 }
@@ -631,7 +671,7 @@ static void updateboid(boid *ball, physics_state *state, fix15 bounciness)
     // Record the gap as soon as the boid clears the bottom row.
     // Waiting until the screen edge lets horizontal drift change the bin.
     const fix15 bottom_row_y = PEG_Y + int2fix15((PEG_ROWS - 1) * PEG_VERTICAL_SPACING);
-    if (!ball->histogram_recorded &&
+    if (!histogram_recorded &&
         y > bottom_row_y + int2fix15(PEG_RADIUS + boid_RADIUS))
     {
         const fix15 first_peg_x =
@@ -641,7 +681,7 @@ static void updateboid(boid *ball, physics_state *state, fix15 bounciness)
         int bin = offset < 0 ? -1 : offset / int2fix15(PEG_HORIZONTAL_SPACING);
         if (bin >= 0 && bin < HISTOGRAM_BINS)
             state->histogram[bin]++;
-        ball->histogram_recorded = true;
+        *ball_state = HISTOGRAM_RECORDED;
     }
 
     // Respawn this boid after it falls completely below the screen.
@@ -649,7 +689,7 @@ static void updateboid(boid *ball, physics_state *state, fix15 bounciness)
     {
         ++state->fallen;
 
-        dropboid(ball, &state->rng);
+        dropboid(ball, ball_state, &state->rng);
         return; // reset the new drop's initial y-velocity to zero
     }
     vy += GRAVITY;
@@ -663,10 +703,15 @@ static void updateRange(int begin, int end, physics_state *state)
 {
     state->collisions = 0;
     state->fallen = 0;
+#if LAB_COLLISION_PROFILE
+    state->peg_rows_checked = 0;
+    state->peg_candidates = 0;
+    state->distance_checks = 0;
+#endif
     memset(state->histogram, 0, sizeof(state->histogram));
     fix15 bounciness = frame_bounciness;
     for (int i = begin; i < end; ++i)
-        updateboid(&boids[i], state, bounciness);
+        updateboid(&boids[i], &boid_state[i], state, bounciness);
 }
 
 static void drawBallRows(unsigned parity);
@@ -691,9 +736,17 @@ static void mergePhysics(void)
     for (int core = 0; core < 2; ++core) {
         peg_sound_events += physics[core].collisions;
         total_fallen += physics[core].fallen;
+#if LAB_COLLISION_PROFILE
+        profile_peg_rows_checked += physics[core].peg_rows_checked;
+        profile_peg_candidates += physics[core].peg_candidates;
+        profile_distance_checks += physics[core].distance_checks;
+#endif
         for (int bin = 0; bin < HISTOGRAM_BINS; ++bin)
             histogram[bin] += physics[core].histogram[bin];
     }
+#if LAB_COLLISION_PROFILE
+    ++profile_frames;
+#endif
 }
 
 // Alternate scanlines give both cores disjoint framebuffer bytes, even for
@@ -717,7 +770,7 @@ static void drawBallRows(unsigned parity)
     memset(cache, 0xff, sizeof(drawn_centers[0]));
 #endif
     for (int i = 0; i < boid_count; ++i) {
-        if (boids[i].histogram_recorded) continue;
+        if (boid_state[i] == HISTOGRAM_RECORDED) continue;
         int x = boids[i].x >> 5;
         int y = boids[i].y >> 5;
         if (x >= -BOARD_BALL_DRAW_RADIUS && x <= 639 + BOARD_BALL_DRAW_RADIUS &&
@@ -882,6 +935,18 @@ static PT_THREAD(protothread_anim(struct pt *pt))
         elapsed_us = (uint32_t)(time_us_32() - frame_start_us);
         missed_deadline = elapsed_us > FRAME_BUDGET_US || draw_frame_expired();
         vga_frame_complete(); // No framebuffer writes until the next acquisition.
+#if LAB_COLLISION_PROFILE
+        if (profile_frames >= 120) {
+            printf("COLLISION_PROFILE,%u,%llu,%llu,%llu\n", profile_frames,
+                   (unsigned long long)(profile_peg_rows_checked / profile_frames),
+                   (unsigned long long)(profile_peg_candidates / profile_frames),
+                   (unsigned long long)(profile_distance_checks / profile_frames));
+            profile_frames = 0;
+            profile_peg_rows_checked = 0;
+            profile_peg_candidates = 0;
+            profile_distance_checks = 0;
+        }
+#endif
 #if LAB_CAPACITY_CALIBRATION
         finishCalibrationFrame(missed_deadline, elapsed_us);
 #endif

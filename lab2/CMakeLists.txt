@@ -39,6 +39,7 @@ if(NOT LAB_INITIAL_BALL_COUNT MATCHES "^[0-9]+$")
     message(FATAL_ERROR "LAB_INITIAL_BALL_COUNT must be a non-negative integer")
 endif()
 option(LAB_CAPACITY_CALIBRATION "Run the startup capacity search for benchmarks" OFF)
+option(LAB_COLLISION_PROFILE "Report average collision-search work every 120 frames" OFF)
 set(LAB_CALIBRATION_WARMUP_FRAMES 600 CACHE STRING "Frames before timing each trial")
 set(LAB_CALIBRATION_FRAMES 600 CACHE STRING "Timed frames per capacity trial")
 set(LAB_BENCH_DEFINITIONS
@@ -71,6 +72,9 @@ target_compile_definitions(VGA_Animation_Demo PRIVATE
     LAB_CALIBRATION_FRAMES=${LAB_CALIBRATION_FRAMES})
 if(LAB_CAPACITY_CALIBRATION)
     target_compile_definitions(VGA_Animation_Demo PRIVATE LAB_CAPACITY_CALIBRATION=1)
+endif()
+if(LAB_COLLISION_PROFILE)
+    target_compile_definitions(VGA_Animation_Demo PRIVATE LAB_COLLISION_PROFILE=1)
 endif()
 
 # must match with pio filename and executable name from above

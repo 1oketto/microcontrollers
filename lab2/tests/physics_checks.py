@@ -41,6 +41,7 @@ preamble = """
 #include <limits.h>
 #include <math.h>
 #include <string.h>
+#define LAB_COLLISION_PROFILE 1
 #include "board_config.h"
 """
 preamble += section("typedef signed int fix15;", "static fix15 peg_x")
@@ -75,13 +76,14 @@ static int sample(int low, int high) {
     return low + (int)(nextRandom(&rng) % (unsigned)(high - low + 1));
 }
 
-static void compareBall(boid input, fix15 bounciness) {
+static void compareBall(boid input, uint8_t input_state, fix15 bounciness) {
     boid a = input, b = input;
+    uint8_t state_a = input_state, state_b = input_state;
     physics_state sa = {.rng = 19}, sb = {.rng = 19};
-    updateboid_optimized(&a, &sa, bounciness);
-    updateboid_reference(&b, &sb, bounciness);
+    updateboid_optimized(&a, &state_a, &sa, bounciness);
+    updateboid_reference(&b, &state_b, &sb, bounciness);
     assert(a.x == b.x && a.y == b.y && a.vx == b.vx && a.vy == b.vy);
-    assert(a.last_peg == b.last_peg && a.histogram_recorded == b.histogram_recorded);
+    assert(state_a == state_b);
     assert(sa.rng == sb.rng && sa.collisions == sb.collisions && sa.fallen == sb.fallen);
     assert(memcmp(sa.histogram, sb.histogram, sizeof(sa.histogram)) == 0);
 }
@@ -94,10 +96,12 @@ int main(void) {
     uint32_t distribution_spawn_rng = 0x1b873593u;
     for (unsigned sample_index = 0; sample_index < 16384; ++sample_index) {
         boid sample_ball;
-        dropboid(&sample_ball, &distribution_spawn_rng);
-        for (unsigned frame = 0; frame < 1000 && !sample_ball.histogram_recorded; ++frame)
-            updateboid_optimized(&sample_ball, &distribution, coefficients[5]);
-        assert(sample_ball.histogram_recorded);
+        uint8_t sample_state;
+        dropboid(&sample_ball, &sample_state, &distribution_spawn_rng);
+        for (unsigned frame = 0; frame < 1000 &&
+             sample_state != HISTOGRAM_RECORDED; ++frame)
+            updateboid_optimized(&sample_ball, &sample_state, &distribution, coefficients[5]);
+        assert(sample_state == HISTOGRAM_RECORDED);
     }
     int histogram_total = 0;
     uint64_t mirror_difference = 0;
@@ -113,16 +117,21 @@ int main(void) {
     }
     assert(histogram_total >= 16384 * 8 / 10);
     assert(mirror_difference * 10 <= (uint64_t)histogram_total);
+    assert(distribution.peg_rows_checked > 0);
+    assert(distribution.peg_candidates >= distribution.distance_checks);
+    assert(distribution.distance_checks > 0);
 
     boid separated_ball = {
         .x = packFixed(peg_x[0], 10),
         .y = packFixed(peg_y[0] -
                        int2fix15(BOARD_BALL_RADIUS + BOARD_PEG_RADIUS + 1), 10),
-        .vx = 0, .vy = 512, .last_peg = 0
+        .vx = 0, .vy = 512
     };
+    uint8_t separated_ball_state = 0;
     physics_state separated_state = {.rng = 19};
-    updateboid_optimized(&separated_ball, &separated_state, coefficients[5]);
-    assert(separated_ball.last_peg == NO_PEG);
+    updateboid_optimized(&separated_ball, &separated_ball_state,
+                         &separated_state, coefficients[5]);
+    assert(separated_ball_state == NO_PEG);
 
     for (unsigned i = 0; i < 200000; ++i) {
         fix15 a = sample(-1048576, 1048576), b = sample(-32768, 32768);
@@ -149,8 +158,8 @@ int main(void) {
             for (int dx = -9; dx <= 9; ++dx) {
                 boid ball = {.x = packFixed(peg_x[peg] + int2fix15(dx), 10),
                              .y = packFixed(peg_y[peg] + int2fix15(dy), 10),
-                             .vx = 0, .vy = 0, .last_peg = NO_PEG};
-                compareBall(ball, coefficients[(unsigned)(dx + dy + 18) %
+                             .vx = 0, .vy = 0};
+                compareBall(ball, NO_PEG, coefficients[(unsigned)(dx + dy + 18) %
                             (sizeof(coefficients) / sizeof(coefficients[0]))]);
             }
 
@@ -159,25 +168,27 @@ int main(void) {
         boid ball = {.x = (int16_t)sample(-100 * 32, 740 * 32),
                      .y = (int16_t)sample(-20 * 32, 510 * 32),
                      .vx = (int16_t)sample(INT16_MIN, INT16_MAX),
-                     .vy = (int16_t)sample(INT16_MIN, INT16_MAX),
-                     .last_peg = (uint8_t)sample(0, UINT8_MAX),
-                     .histogram_recorded = (nextRandom(&rng) & 1u) != 0};
-        compareBall(ball, coefficients[i % (sizeof(coefficients) / sizeof(coefficients[0]))]);
+                     .vy = (int16_t)sample(INT16_MIN, INT16_MAX)};
+        uint8_t ball_state = (uint8_t)sample(0, UINT8_MAX);
+        compareBall(ball, ball_state,
+                    coefficients[i % (sizeof(coefficients) / sizeof(coefficients[0]))]);
     }
 
     // Sustained trajectories accumulate state over many frames. Divergence can
     // reveal a missed later collision that a one-frame random sample misses.
     for (unsigned j = 0; j < sizeof(coefficients) / sizeof(coefficients[0]); ++j) {
         physics_state sa = {.rng = 117}, sb = {.rng = 117};
+        uint8_t state_a, state_b;
         boid a, b;
         uint32_t spawn = 3;
-        dropboid(&a, &spawn);
+        dropboid(&a, &state_a, &spawn);
         b = a;
+        state_b = state_a;
         for (unsigned frame = 0; frame < 20000; ++frame) {
-            updateboid_optimized(&a, &sa, coefficients[j]);
-            updateboid_reference(&b, &sb, coefficients[j]);
+            updateboid_optimized(&a, &state_a, &sa, coefficients[j]);
+            updateboid_reference(&b, &state_b, &sb, coefficients[j]);
             assert(a.x == b.x && a.y == b.y && a.vx == b.vx && a.vy == b.vy);
-            assert(a.last_peg == b.last_peg && a.histogram_recorded == b.histogram_recorded);
+            assert(state_a == state_b);
             assert(sa.rng == sb.rng && sa.collisions == sb.collisions && sa.fallen == sb.fallen);
             assert(memcmp(sa.histogram, sb.histogram, sizeof(sa.histogram)) == 0);
         }
