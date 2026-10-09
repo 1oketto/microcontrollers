@@ -204,20 +204,10 @@ void newCircleRows(short x, short y, unsigned parity)
     mono_stamp_peg((uint8_t *)current_draw_buffer, x, y, parity & 1u);
 }
 
-void referenceCircleRows(short x, short y, unsigned parity)
-{
-    mono_reference_peg((uint8_t *)current_draw_buffer, x, y, parity & 1u);
-}
-
 // Ball sprites are drawn smaller than their physical collision radius.
 void drawWhiteBallRows(short x, short y, unsigned parity)
 {
     mono_stamp_ball_outline((uint8_t *)current_draw_buffer, x, y, parity & 1u);
-}
-
-void referenceWhiteBallRows(short x, short y, unsigned parity)
-{
-    mono_reference_ball_outline((uint8_t *)current_draw_buffer, x, y, parity & 1u);
 }
 
 // Check status of neighbors

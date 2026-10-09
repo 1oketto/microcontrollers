@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""Build controlled Pico variants, import serial logs, and draw honest SVG charts.
+"""Import saved benchmark serial logs and draw SVG charts.
 
-No third-party dependencies. Never flashes a board or invents missing results.
+This tool only processes existing measurements; it does not build or calibrate
+firmware and never invents missing results.
 """
 import argparse
 import csv
 import html
-import json
-import os
 from pathlib import Path
-import shutil
-import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 HERE = Path(__file__).resolve().parent
@@ -25,29 +22,6 @@ VARIANTS = {
 }
 TRIAL_FIELDS = ["variant", "clock_hz", "voltage_mv", "balls", "warmup_frames",
                 "frames", "max_us", "mean_us", "misses", "passed"]
-
-
-def cache_value(key):
-    for line in (ROOT / "build/CMakeCache.txt").read_text().splitlines():
-        if line.startswith(key + ":"):
-            return line.split("=", 1)[1]
-    raise SystemExit(f"Missing {key} in build/CMakeCache.txt")
-
-
-def build(args):
-    cmake = args.cmake or shutil.which("cmake") or cache_value("CMAKE_COMMAND")
-    ninja = cache_value("CMAKE_MAKE_PROGRAM")
-    variants = VARIANTS if args.variant == "all" else [args.variant]
-    for variant in variants:
-        directory = ROOT / "build" / "bench" / variant
-        subprocess.run([cmake, "-S", str(ROOT), "-B", str(directory), "-G", "Ninja",
-                        f"-DCMAKE_MAKE_PROGRAM={ninja}", "-DCMAKE_BUILD_TYPE=Release",
-                        "-DPICO_BOARD=pico2", f"-DLAB_BENCH_VARIANT={variant}",
-                        "-DLAB_CAPACITY_CALIBRATION=ON",
-                        f"-DLAB_CALIBRATION_WARMUP_FRAMES={args.warmup}",
-                        f"-DLAB_CALIBRATION_FRAMES={args.frames}"], check=True)
-        subprocess.run([cmake, "--build", str(directory), "-j", str(args.jobs)], check=True)
-        print(directory / "VGA_Animation_Demo.uf2")
 
 
 def write_csv(path, fields, rows):
@@ -175,21 +149,12 @@ def charts():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    cmd = commands.add_parser("build")
-    cmd.add_argument("--variant", choices=[*VARIANTS, "all"], default="all")
-    cmd.add_argument("--cmake")
-    cmd.add_argument("--warmup", type=int, default=600)
-    cmd.add_argument("--frames", type=int, default=600)
-    cmd.add_argument("--jobs", type=int, default=4)
-    cmd.set_defaults(func=build)
     cmd = commands.add_parser("collect")
     cmd.add_argument("logs", nargs="+")
     cmd.set_defaults(func=collect)
     cmd = commands.add_parser("charts")
     cmd.set_defaults(func=lambda args: charts())
     args = parser.parse_args()
-    if args.command == "build" and (args.frames <= 0 or args.warmup < 0):
-        parser.error("frames must be positive and warmup nonnegative")
     args.func(args)
 
 

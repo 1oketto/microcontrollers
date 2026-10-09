@@ -145,9 +145,7 @@ static inline void mono_reference_ball_outline(uint8_t *buffer, int x, int y,
     mono_reference_circle_outline_radius(buffer, x, y, parity, BOARD_BALL_DRAW_RADIUS);
 }
 
-/* Deliberately generic midpoint reference for the LAB_GENERIC_CIRCLE ablation.
- * It draws the identical filled shape through per-pixel clipping and masks.
- */
+/* Midpoint references used by host raster tests. */
 static inline void mono_reference_span(uint8_t *buffer, int x, int y0, int y1, unsigned parity)
 {
     if ((unsigned)x >= MONO_WIDTH) return;

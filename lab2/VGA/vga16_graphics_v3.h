@@ -61,12 +61,8 @@ void drawPixel(short x, short y, char color) ;
 void newCircle(short x, short y);
 // Concurrency: opposite SCREEN-row parities own disjoint framebuffer bytes.
 void newCircleRows(short x, short y, unsigned parity);
-// Generic midpoint ablation with the same filled raster and parity ownership.
-void referenceCircleRows(short x, short y, unsigned parity);
-// Draw a hollow radius-four white ball, with parity ownership for dual-core rendering.
+// Draw a one-pixel white ball, assigned to the owning scanline parity.
 void drawWhiteBallRows(short x, short y, unsigned parity);
-// Generic midpoint outline used by the LAB_GENERIC_CIRCLE ablation.
-void referenceWhiteBallRows(short x, short y, unsigned parity);
 void drawVLine(short x, short y, short h, char color) ;
 void drawHLine(int x, int y, int w, char color) ; // faster mod 5/11/2025
 void drawLine(short x0, short y0, short x1, short y1, char color) ;

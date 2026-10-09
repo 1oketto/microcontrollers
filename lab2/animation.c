@@ -16,36 +16,30 @@
   - RP2040 GND ---> VGA-GND
  *
  * RESOURCES USED
- *  - PIO0 state machines 0/1 for sync, PIO1 state machine 0 for pixels
- *  - 6 claimed DMA channels: VGA including background (4), sound (2)
- *  - 76.8 KB of RAM for two monochrome buffers; 38.4 KB background in flash
+ *  - PIO0 state machines 0/1 for sync and PIO1 state machine 0 for pixels
+ *  - One VGA DMA channel and two audio DMA channels
+ *  - 76.8 KB of RAM for two monochrome framebuffers
  *
  */
 
-// Include the VGA grahics library
 #include "VGA/vga16_graphics_v3.h"
 #include "board_config.h"
-// Include standard libraries
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
 #include <limits.h>
 #include <stdatomic.h>
-// Include Pico libraries
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "pico/sync.h"
-// Include hardware libraries
 #include "hardware/pio.h"
 #include "hardware/dma.h"
 #include "hardware/spi.h"
 #include "hardware/clocks.h"
-#include "hardware/pll.h"
 #include "hardware/gpio.h"
 #include "hardware/sync.h"
 #include "hardware/vreg.h"
-// Include protothreads
 #include "pt_cornell_rp2040_v1_4.h"
 
 // Number of samples per period in sine table
@@ -79,53 +73,15 @@ static uint32_t peg_sound_events = 0; // how many collisions have happened
 
 // 60 fps gives each animation frame 16,666 microseconds.
 #define FRAME_BUDGET_US (1000000u / 60u)
-#ifndef LAB_BENCH_VARIANT
-#define LAB_BENCH_VARIANT "full"
-#endif
-#ifndef LAB_CALIBRATION_WARMUP_FRAMES
-#define LAB_CALIBRATION_WARMUP_FRAMES 600u
-#endif
-#ifndef LAB_CALIBRATION_FRAMES
-#define LAB_CALIBRATION_FRAMES 600u
-#endif
 #ifndef LAB_INITIAL_BALL_COUNT
 #define LAB_INITIAL_BALL_COUNT 25000
-#endif
-#ifndef LAB_CAPACITY_CALIBRATION
-#define LAB_CAPACITY_CALIBRATION 0
-#endif
-#ifndef LAB_SINGLE_CORE
-#define LAB_SINGLE_CORE 0
-#endif
-#ifndef LAB_GENERIC_CIRCLE
-#define LAB_GENERIC_CIRCLE 0
-#endif
-#ifndef LAB_NO_DRAW_CACHE
-#define LAB_NO_DRAW_CACHE 0
-#endif
-#ifndef LAB_NO_TEXT_CACHE
-#define LAB_NO_TEXT_CACHE 0
 #endif
 #ifndef LAB_COLLISION_PROFILE
 #define LAB_COLLISION_PROFILE 0
 #endif
-_Static_assert(LAB_CALIBRATION_FRAMES > 0, "A trial must time at least one frame");
 #define ROTARY_BALL_STEP 1
 _Static_assert(LAB_INITIAL_BALL_COUNT >= 0, "Initial ball count cannot be negative");
 _Static_assert(LAB_INITIAL_BALL_COUNT <= INT_MAX, "Initial ball count exceeds the supported count type");
-#if LAB_CAPACITY_CALIBRATION
-static volatile bool calibrating = true;
-static int calibration_good = -1; // No untested count is assumed to pass.
-static int calibration_bad = INT_MAX;
-static unsigned calibration_frames = 0;
-static unsigned calibration_warmup = 0;
-static uint64_t calibration_total_us = 0;
-static uint32_t calibration_max_us = 0;
-static int calibration_target = LAB_INITIAL_BALL_COUNT > 0
-    ? LAB_INITIAL_BALL_COUNT : 1;
-#else
-static volatile bool calibrating = false;
-#endif
 
 // rotary encoder GPIOs (C_PIN is connected to GND pin 18)
 #define A_PIN 13
@@ -188,9 +144,6 @@ void gpio_callback(uint gpio, uint32_t events)
 {
     if (gpio != A_PIN || !(events & GPIO_IRQ_EDGE_FALL))
         return;
-    // A manual adjustment takes over immediately instead of waiting for the
-    // multi-trial startup calibration to finish.
-    calibrating = false;
     if (edit_bounciness) {
         int level = bounciness_level + (gpio_get(B_PIN) ? 1 : -1);
         if (level < 0) level = 0;
@@ -215,7 +168,6 @@ void gpio_callback(uint gpio, uint32_t events)
     }
 }
 
-// play a DMA sound for each boid-peg collision
 static PT_THREAD(protothread_sound(struct pt *pt))
 {
     static uint32_t played_peg_events = 0; // how many collision sounds we've already played
@@ -432,96 +384,6 @@ static void resetStatisticsIfRequested(void)
         total_fallen = 0;
     }
 }
-
-// Start each trial with the same drop sequence so counts are comparable.
-#if LAB_CAPACITY_CALIBRATION
-static void startCalibrationTrial(int count)
-{
-    calibration_target = count;
-    rotary_count = count;
-    syncboidCount();
-    if (boid_count != count) {
-        printf("CAPACITY_MEMORY_LIMIT,%s,%d,%d\n",
-               LAB_BENCH_VARIANT, count, boid_count);
-        calibrating = false;
-        return;
-    }
-    spawn_rng = 3;
-    physics[0].rng = 1;
-    physics[1].rng = 2;
-    for (int i = 0; i < boid_count; ++i)
-        dropboid(&boids[i], &boid_state[i], &spawn_rng);
-    memset(histogram, 0, sizeof(histogram));
-    total_fallen = 0;
-    calibration_frames = 0;
-    calibration_warmup = 0;
-    calibration_total_us = 0;
-    calibration_max_us = 0;
-}
-
-// Time only steady-state frames; log after submitting the framebuffer so serial
-// output is outside the timed region. Warmup on the next trial absorbs logging.
-static void finishCalibrationFrame(bool missed_deadline, uint32_t elapsed_us)
-{
-    if (!calibrating) return;
-    if (calibration_warmup < LAB_CALIBRATION_WARMUP_FRAMES) {
-        ++calibration_warmup;
-        return;
-    }
-    ++calibration_frames;
-    calibration_total_us += elapsed_us;
-    if (elapsed_us > calibration_max_us) calibration_max_us = elapsed_us;
-    if (!missed_deadline && calibration_frames < LAB_CALIBRATION_FRAMES) return;
-
-    printf("BENCH,%s,%lu,1300,%d,%u,%u,%lu,%lu,%u,%u\n",
-           LAB_BENCH_VARIANT, (unsigned long)clock_get_hz(clk_sys),
-           calibration_target, calibration_warmup, calibration_frames,
-           (unsigned long)calibration_max_us,
-           (unsigned long)(calibration_total_us / calibration_frames),
-           missed_deadline ? 1u : 0u, missed_deadline ? 0u : 1u);
-    if (missed_deadline) calibration_bad = calibration_target;
-    else calibration_good = calibration_target;
-
-    if (calibration_bad != INT_MAX &&
-        (int64_t)calibration_bad - calibration_good <= 1) {
-        rotary_count = calibration_good < 0 ? 0 : calibration_good;
-        syncboidCount();
-        spawn_rng = time_us_32() | 1u;
-        physics[0].rng = spawn_rng;
-        physics[1].rng = spawn_rng ^ 0x9e3779b9u;
-        if (physics[1].rng == 0) physics[1].rng = 2;
-        for (int i = 0; i < boid_count; ++i)
-            dropboid(&boids[i], &boid_state[i], &spawn_rng);
-        memset(histogram, 0, sizeof(histogram));
-        total_fallen = 0;
-        calibrating = false;
-        if (calibration_good >= 0)
-            printf("CAPACITY,%s,%d,%d,%u\n", LAB_BENCH_VARIANT,
-                   calibration_good, calibration_bad, 0u);
-        else
-            printf("BENCH_ERROR,%s,even_zero_balls_missed_deadline\n", LAB_BENCH_VARIANT);
-        return;
-    }
-    int next;
-    if (calibration_bad == INT_MAX) {
-        if (calibration_target == INT_MAX) {
-            rotary_count = calibration_target;
-            calibrating = false;
-            printf("CAPACITY,%s,%d,0,0\n",
-                   LAB_BENCH_VARIANT, calibration_target);
-            return;
-        }
-        next = calibration_target > INT_MAX / 2
-            ? INT_MAX : calibration_target * 2;
-    } else {
-        next = calibration_good < 0
-            ? calibration_bad / 2
-            : calibration_good + (int)(((int64_t)calibration_bad -
-                                        calibration_good) / 2);
-    }
-    startCalibrationTrial(next);
-}
-#endif
 
 // Pico 2 has hardware floating-point square root. Use it for an initial root,
 // then correct against the exact integer square to retain Q15 collision results.
@@ -797,11 +659,9 @@ static void drawBallRows(unsigned parity)
 
     // An exact-key cache skips redundant stamps when many balls overlap.
     // Hash collisions merely cause another draw; they never hide another ball.
-#if !LAB_NO_DRAW_CACHE
     static uint32_t drawn_centers[2][256];
     uint32_t *cache = drawn_centers[parity];
     memset(cache, 0xff, sizeof(drawn_centers[0]));
-#endif
     for (int i = 0; i < boid_count; ++i) {
         if (boid_state[i] == HISTOGRAM_RECORDED) continue;
         int x = boids[i].x >> 5;
@@ -813,18 +673,12 @@ static void drawBallRows(unsigned parity)
             // other core can skip its cache and stamp work entirely.
             if (((unsigned)y & 1u) != parity) continue;
 #endif
-#if !LAB_NO_DRAW_CACHE
             uint32_t key = ((uint32_t)(y + BOARD_BALL_DRAW_RADIUS) << 10) |
                            (uint32_t)(x + BOARD_BALL_DRAW_RADIUS);
             unsigned slot = (key ^ (key >> 8)) & 255u;
             if (cache[slot] == key) continue;
             cache[slot] = key;
-#endif
-#if LAB_GENERIC_CIRCLE
-            referenceWhiteBallRows(x, y, parity);
-#else
             drawWhiteBallRows(x, y, parity);
-#endif
         }
     }
 }
@@ -837,21 +691,21 @@ static void drawStats(void)
     static uint64_t last_fallen = UINT64_MAX, last_seconds = UINT64_MAX;
     uint64_t seconds = time_us_64() / 1000000u;
     int bounciness = bounciness_q15;
-    if (LAB_NO_TEXT_CACHE || boid_count != last_count) {
+    if (boid_count != last_count) {
         snprintf(ball_text, sizeof(ball_text), "%d", boid_count);
         last_count = boid_count;
     }
-    if (LAB_NO_TEXT_CACHE || total_fallen != last_fallen) {
+    if (total_fallen != last_fallen) {
         snprintf(fallen_text, sizeof(fallen_text), "%llu",
                  (unsigned long long)total_fallen);
         last_fallen = total_fallen;
     }
-    if (LAB_NO_TEXT_CACHE || bounciness != last_bounciness) {
+    if (bounciness != last_bounciness) {
         snprintf(bounce_text, sizeof(bounce_text), "%d%%",
                  bounciness_level * 10);
         last_bounciness = bounciness;
     }
-    if (LAB_NO_TEXT_CACHE || seconds != last_seconds) {
+    if (seconds != last_seconds) {
         snprintf(time_text, sizeof(time_text), "%llu:%02u:%02u",
                  (unsigned long long)(seconds / 3600),
                  (unsigned)((seconds / 60) % 60), (unsigned)(seconds % 60));
@@ -878,12 +732,6 @@ static void drawStats(void)
     writeString("Time since boot: ");
     setCursor(22 + 6 * (sizeof("Time since boot: ") - 1), 40);
     writeString(time_text);
-#if LAB_CAPACITY_CALIBRATION
-    if (calibrating) {
-        setCursor(22, 50);
-        writeString("Calibrating 60 fps capacity...");
-    }
-#endif
     if (ball_allocation_failed) {
         setCursor(22, 50);
         writeString("Ball memory limit reached");
@@ -913,7 +761,7 @@ static void drawHistogram(void)
             drawRect(bin_x, baseline - bar_height,
                      PEG_HORIZONTAL_SPACING - 1, bar_height, WHITE);
 
-        if (LAB_NO_TEXT_CACHE || count_text[i][0] == '\0' || histogram[i] != last_count[i]) {
+        if (count_text[i][0] == '\0' || histogram[i] != last_count[i]) {
             snprintf(count_text[i], sizeof(count_text[i]), "%d", histogram[i]);
             last_count[i] = histogram[i];
         }
@@ -933,9 +781,6 @@ static PT_THREAD(protothread_anim(struct pt *pt))
     PT_BEGIN(pt);
 
     initPegs();
-#if LAB_CAPACITY_CALIBRATION
-    startCalibrationTrial(calibration_target);
-#endif
 
     while (1)
     {
@@ -947,14 +792,6 @@ static PT_THREAD(protothread_anim(struct pt *pt))
         syncboidCount();
         frame_bounciness = BOUNCINESS;
         split = boid_count / 2;
-#if LAB_SINGLE_CORE
-        // Preserve both RNG streams and ranges for an identical workload.
-        updateRange(0, split, &physics[0]);
-        updateRange(split, boid_count, &physics[1]);
-        mergePhysics();
-        drawBallRows(0);
-        drawBallRows(1);
-#else
         worker_begin = split;
         worker_end = boid_count;
         worker_draw = false;
@@ -966,7 +803,6 @@ static PT_THREAD(protothread_anim(struct pt *pt))
         sem_release(&physics_start);
         drawBallRows(0);
         PT_YIELD_UNTIL(pt, sem_try_acquire(&physics_done));
-#endif
         resetStatisticsIfRequested();
         drawStats();
         drawHistogram();
@@ -985,9 +821,6 @@ static PT_THREAD(protothread_anim(struct pt *pt))
             profile_peg_candidates = 0;
             profile_distance_checks = 0;
         }
-#endif
-#if LAB_CAPACITY_CALIBRATION
-        finishCalibrationFrame(missed_deadline, elapsed_us);
 #endif
         // NEVER exit while
     } // END WHILE(1)
