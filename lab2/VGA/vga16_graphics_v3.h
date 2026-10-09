@@ -54,6 +54,10 @@ void drawHLine(int x, int y, int w, char color) ; // faster mod 5/11/2025
 void drawLine(short x0, short y0, short x1, short y1, char color) ;
 void drawRect(short x, short y, short w, short h, char color);
 void drawCircle(short x0, short y0, short r, char color) ;
+
+void drawPixelParity(short x, short y, char color, unsigned parity) // NEW for parallel core drawing
+void drawCircleParity(short x0, short y0, short r, char color, unsigned parity); // NEW
+
 void drawCircleHelper( short x0, short y0, short r, unsigned char cornername, char color) ;
 void fillCircle(short x0, short y0, short r, char color) ;
 void fillCircleHelper(short x0, short y0, short r, unsigned char cornername, short delta, char color) ;
