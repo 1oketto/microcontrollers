@@ -28,49 +28,7 @@ pico_sdk_init()
 
 add_executable(VGA_Animation_Demo)
 
-target_compile_options(VGA_Animation_Demo PRIVATE -O3)
-
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
-add_custom_target(check_vga_background
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/tools/generate_vga_background.py --check
-    COMMENT "Checking flash bitmap against board geometry and fonts")
-add_dependencies(VGA_Animation_Demo check_vga_background)
-
-# One-variable ablations for on-board measurements. These are comparisons with
-# the final build, not cumulative speedups and not substitutes for old firmware.
-set(LAB_BENCH_VARIANT "full" CACHE STRING "Benchmark variant")
-set_property(CACHE LAB_BENCH_VARIANT PROPERTY STRINGS full full_scan single_core pixel_stamps ram_background general_damping reference_normal no_draw_cache no_text_cache)
-set(LAB_CALIBRATION_WARMUP_FRAMES 600 CACHE STRING "Frames before timing each trial")
-set(LAB_CALIBRATION_FRAMES 600 CACHE STRING "Timed frames per capacity trial")
-set(LAB_BENCH_DEFINITIONS
-    full_scan:LAB_FULL_PEG_SCAN
-    single_core:LAB_SINGLE_CORE
-    pixel_stamps:LAB_GENERIC_CIRCLE
-    ram_background:LAB_RAM_BACKGROUND
-    general_damping:LAB_GENERAL_DAMPING
-    reference_normal:LAB_REFERENCE_NORMAL
-    no_draw_cache:LAB_NO_DRAW_CACHE
-    no_text_cache:LAB_NO_TEXT_CACHE)
-set(LAB_VARIANT_FOUND FALSE)
-if(LAB_BENCH_VARIANT STREQUAL "full")
-    set(LAB_VARIANT_FOUND TRUE)
-endif()
-foreach(pair IN LISTS LAB_BENCH_DEFINITIONS)
-    string(REPLACE ":" ";" parts "${pair}")
-    list(GET parts 0 variant)
-    list(GET parts 1 flag)
-    if(LAB_BENCH_VARIANT STREQUAL variant)
-        target_compile_definitions(VGA_Animation_Demo PRIVATE ${flag}=1)
-        set(LAB_VARIANT_FOUND TRUE)
-    endif()
-endforeach()
-if(NOT LAB_VARIANT_FOUND)
-    message(FATAL_ERROR "Unknown LAB_BENCH_VARIANT: ${LAB_BENCH_VARIANT}")
-endif()
-target_compile_definitions(VGA_Animation_Demo PRIVATE
-    LAB_BENCH_VARIANT="${LAB_BENCH_VARIANT}"
-    LAB_CALIBRATION_WARMUP_FRAMES=${LAB_CALIBRATION_WARMUP_FRAMES}
-    LAB_CALIBRATION_FRAMES=${LAB_CALIBRATION_FRAMES})
+add_compile_options(-Ofast)
 
 # must match with pio filename and executable name from above
 pico_generate_pio_header(VGA_Animation_Demo ${CMAKE_CURRENT_LIST_DIR}/VGA/hsync.pio)
@@ -96,10 +54,6 @@ target_link_libraries(  VGA_Animation_Demo
                         hardware_clocks
                         hardware_vreg
                         hardware_pll)
-
-# USB serial exposes the BENCH/CAPACITY records without an external UART adapter.
-pico_enable_stdio_usb(VGA_Animation_Demo 1)
-pico_enable_stdio_uart(VGA_Animation_Demo 1)
 
 # must match with executable name
 pico_add_extra_outputs(VGA_Animation_Demo)

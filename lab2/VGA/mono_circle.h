@@ -8,12 +8,13 @@
 #define MONO_ROW_BYTES (MONO_WIDTH / 8)
 #define MONO_CIRCLE_RADIUS 4
 
-/* Radius-four Adafruit midpoint fill raster, in a 9 x 9 bounding box.
+/* Radius-four fillCircle raster, in a 9 x 9 bounding box.
+ * Match the original sqrt(r*r+r-dy*dy) spans, including their left bias.
  * Precomputing the shape removes circle stepping and individual pixel calls.
  * A row occupies at most two framebuffer bytes, even at an unaligned x.
  */
 static const uint16_t mono_circle_rows[9] = {
-    0x038, 0x0fe, 0x0fe, 0x1ff, 0x1ff, 0x1ff, 0x0fe, 0x0fe, 0x038
+    0x03c, 0x07e, 0x0ff, 0x0ff, 0x0ff, 0x0ff, 0x0ff, 0x07e, 0x03c
 };
 
 /* parity 0/1 owns even/odd SCREEN rows; parity 2 stamps all rows. */
@@ -51,29 +52,4 @@ static inline void mono_stamp_circle(uint8_t *buffer, int x, int y, unsigned par
     }
 }
 
-/* Deliberately generic midpoint reference for the LAB_GENERIC_CIRCLE ablation.
- * It draws the identical filled shape through per-pixel clipping and masks.
- */
-static inline void mono_reference_span(uint8_t *buffer, int x, int y0, int y1, unsigned parity)
-{
-    if ((unsigned)x >= MONO_WIDTH) return;
-    for (int y = y0; y <= y1; ++y)
-        if ((unsigned)y < MONO_HEIGHT && (parity >= 2 || ((unsigned)y & 1u) == parity))
-            buffer[y * MONO_ROW_BYTES + (x >> 3)] |= (uint8_t)(1u << (x & 7));
-}
-
-static inline void mono_reference_circle(uint8_t *buffer, int x0, int y0, unsigned parity)
-{
-    int f = 1 - MONO_CIRCLE_RADIUS, ddx = 1, ddy = -2 * MONO_CIRCLE_RADIUS;
-    int x = 0, y = MONO_CIRCLE_RADIUS;
-    mono_reference_span(buffer, x0, y0 - y, y0 + y, parity);
-    while (x < y) {
-        if (f >= 0) { --y; ddy += 2; f += ddy; }
-        ++x; ddx += 2; f += ddx;
-        mono_reference_span(buffer, x0 + x, y0 - y, y0 + y, parity);
-        mono_reference_span(buffer, x0 - x, y0 - y, y0 + y, parity);
-        mono_reference_span(buffer, x0 + y, y0 - x, y0 + x, parity);
-        mono_reference_span(buffer, x0 - y, y0 - x, y0 + x, parity);
-    }
-}
 #endif

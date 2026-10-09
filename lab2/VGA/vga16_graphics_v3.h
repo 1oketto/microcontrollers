@@ -43,20 +43,16 @@ int isAlive(short x, short y) ;
 
 // VGA init -- Do this before any other libraries
 void initVGA(void) ;
-// The immutable static scene is generated offline into XIP flash.
-// Restored automatically by DMA before draw_start_signal grants ownership.
-void restoreVgaBackground(void);
-int vga_background_ready(void);
 
 // ========================
 // sync signals from DMA channel to thread
-// signal to thread to draw
+// Acquire the next buffer only after its flash-background DMA has completed.
+// Call on the same core as initVGA(); finish with vga_frame_complete().
 int draw_start_signal(void);
 // Submit only after both renderer cores and UI finish; acquires the next frame separately.
 void vga_frame_complete(void);
-// Timestamp and expiry of the drawing frame most recently acquired.
-uint32_t draw_frame_start_us(void);
-int draw_frame_expired(void);
+// Number of VGA refreshes at which the renderer had not submitted a new frame.
+uint32_t vga_missed_frame_count(void);
 // returns 1 for 60 fps, 2 for 30 fps, 3 for no buffer
 int get_buffer_type(void) ;
 
@@ -67,9 +63,6 @@ void drawPixel(short x, short y, char color) ;
 void newCircle(short x, short y);
 // Concurrency: opposite SCREEN-row parities own disjoint framebuffer bytes.
 void newCircleRows(short x, short y, unsigned parity);
-// Generic midpoint ablation with the same filled raster and parity ownership.
-void referenceCircleRows(short x, short y, unsigned parity);
-void drawWhiteBallRows(short x, short y, unsigned parity);
 void drawVLine(short x, short y, short h, char color) ;
 void drawHLine(int x, int y, int w, char color) ; // faster mod 5/11/2025
 void drawLine(short x0, short y0, short x1, short y1, char color) ;
@@ -105,7 +98,7 @@ void clearRegion(short y1, short y2, short c) ;
 
 // ====================
 // buffer handling
-// Static text needs to be duplicated into both buffers
+// Legacy utilities; do not copy into the displayed buffer during animation.
 // copy buffer 0 to 1 and 1 to 0
 void copy_buffer0to1(void) ;
 void copy_buffer1to0(void) ;
