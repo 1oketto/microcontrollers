@@ -551,32 +551,41 @@ static void updateboid(boid *ball, physics_state *state, fix15 bounciness)
     fix15 x = (fix15)ball->x * 1024 + vx;
     fix15 y = (fix15)ball->y * 1024 + vy;
 
-    // Conservative lower bounds preserve the full scan's row/column order.
-    // Later rows/columns test the current position after collision correction.
+    // Conservative lower bounds preserve the full scan's row order.
+    // Later rows test the current position after collision correction.
 #if LAB_FULL_PEG_SCAN
     int first_row = 0;
 #else
     int first_row = (fix2int15(y) - fix2int15(PEG_Y) - radius) / PEG_VERTICAL_SPACING;
     if (first_row < 0) first_row = 0;
 #endif
-    for (int row = first_row; row < PEG_ROWS; ++row)
+    // Once recorded below the bottom row while moving down, a ball cannot
+    // reach another peg. Keep checking if it is moving upward after a bounce.
+    bool can_reach_peg_rows = !ball->histogram_recorded || vy < 0;
+    if (can_reach_peg_rows) for (int row = first_row; row < PEG_ROWS; ++row)
     {
         int row_start = (row * (row + 1)) >> 1;
 #if LAB_FULL_PEG_SCAN
         int first_col = 0;
+        int last_col = row;
 #else
         fix15 row_dy = y - peg_y[row_start];
         if (row_dy <= -int2fix15(radius)) break;
         if (row_dy >= int2fix15(radius)) continue;
-        int first_col = (fix2int15(x) - fix2int15(peg_x[row_start]) - radius)
-                        / PEG_HORIZONTAL_SPACING;
-        if (first_col < 0) first_col = 0;
+        // Peg centers in a row are 38 pixels apart, while the contact
+        // diameter is only 20 pixels, so at most the nearest peg can overlap.
+        fix15 horizontal_offset = x - peg_x[row_start];
+        int nearest_col = (horizontal_offset + int2fix15(PEG_HORIZONTAL_SPACING / 2))
+                          / int2fix15(PEG_HORIZONTAL_SPACING);
+        if (nearest_col < 0 || nearest_col > row) continue;
+        int first_col = nearest_col;
+        int last_col = nearest_col;
 #endif
-        for (int col = first_col; col <= row; ++col)
+        for (int col = first_col; col <= last_col; ++col)
         {
             int peg = row_start + col;
 #if !LAB_FULL_PEG_SCAN
-            if (peg_x[peg] - x >= int2fix15(radius)) break;
+            if (peg_x[peg] - x >= int2fix15(radius)) continue;
 #endif
             fix15 dx = x - peg_x[peg];
             fix15 dy = y - peg_y[peg];
@@ -889,7 +898,7 @@ static PT_THREAD(protothread_anim(struct pt *pt))
 int main()
 {
     // Core DVDD, NOT the 3.3 V I/O rail. Keep the SDK voltage limit enabled.
-    // Raise voltage before the existing 300 MHz overclock (board-test required).
+    // Keep the known-good 300 MHz board clock; 400 MHz caused VGA instability.
     vreg_set_voltage(VREG_VOLTAGE_1_30);
     sleep_ms(10);
     set_sys_clock_khz(300000, true);

@@ -69,7 +69,7 @@ New text commands are re-entrant
 DrawPixel is faster
 */
 
-// PIO clocks, pin mapping, and 640 x 480 timing are unchanged.
+// PIO clocks, pin mapping, and 640 x 480 timing use the known-good 300 MHz setup.
 #define H_ACTIVE 655
 #define V_ACTIVE 479
 #define RGB_ACTIVE 639
