@@ -110,7 +110,7 @@ static uint32_t peg_sound_events = 0; // how many collisions have happened
 #define LAB_COLLISION_PROFILE 0
 #endif
 _Static_assert(LAB_CALIBRATION_FRAMES > 0, "A trial must time at least one frame");
-#define ROTARY_BALL_STEP 10
+#define ROTARY_BALL_STEP 1
 _Static_assert(LAB_INITIAL_BALL_COUNT >= 0, "Initial ball count cannot be negative");
 _Static_assert(LAB_INITIAL_BALL_COUNT <= INT_MAX, "Initial ball count exceeds the supported count type");
 #if LAB_CAPACITY_CALIBRATION
@@ -972,6 +972,7 @@ static PT_THREAD(protothread_anim(struct pt *pt))
         drawHistogram();
         elapsed_us = (uint32_t)(time_us_32() - frame_start_us);
         missed_deadline = elapsed_us > FRAME_BUDGET_US || draw_frame_expired();
+        gpio_put(PICO_DEFAULT_LED_PIN, missed_deadline);
         vga_frame_complete(); // No framebuffer writes until the next acquisition.
 #if LAB_COLLISION_PROFILE
         if (profile_frames >= 120) {
@@ -1007,6 +1008,10 @@ int main()
     set_sys_clock_khz(300000, true);
     // initialize stio
     stdio_init_all();
+
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    gpio_put(PICO_DEFAULT_LED_PIN, false);
 
     // initialize VGA
     initVGA();
