@@ -55,14 +55,15 @@
 #include "pt_cornell_rp2040_v1_4.h"
 
 // TUNING PARAMETERS: edit these values, then rebuild and flash.
-volatile float Kp = 1.0f;            // PWM counts per degree of angle error
-volatile float pwm_bias = 0.0f;      // Baseline motor command (0..6000)
-volatile float desired_angle = 180.0f; // Startup target; serial input updates it
+volatile float Kp = 32.0f;            // PWM counts per degree of angle error
+volatile float pwm_bias = 0.0f;      // Baseline motor command (0..MOTOR_PWM_MAX)
+volatile float desired_angle = 0.0f; // Target: 0 stops motor; otherwise 0..180 degrees
 // Reserved gains: unused while control is proportional-only.
 volatile float Ki = 0.0f, Kd = 0.0f;
 #define ACCEL_FILTER_SHIFT 4        // Accel smoothing: 1/16 per sample
 #define MOTOR_FILTER_SHIFT 6        // VGA motor-command smoothing: 1/64 per sample
 // 150 MHz / (25 * 6000) = 1 kHz. PWM counter runs from 0 to WRAPVAL-1.
+#define MOTOR_PWM_MAX 4000          // Motor command limit; PWM period stays 6000
 #define WRAPVAL 6000
 #define CLKDIV 25.0f
 
@@ -124,9 +125,11 @@ uint slice_num ;
 volatile int old_control ;
 
 static float calculate_control(float angle) {
-    float error = desired_angle - angle;
+    float target = desired_angle;
+    if (target <= 0.0f) return 0.0f; // Explicit motor-off command, regardless of bias.
+    float error = target - angle;
     float output = pwm_bias + Kp * error;
-    return fmaxf(0.0f, fminf(WRAPVAL, output));
+    return fmaxf(0.0f, fminf(MOTOR_PWM_MAX, output));
 }
 
 void drawAxes() {
@@ -308,16 +311,17 @@ static void handle_serial_angle(void) {
     float angle;
     char extra;
     snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-             "Enter an angle from 0 to 360 degrees.\r\n");
+             "Enter 0 to stop, or an angle up to 180 degrees.\r\n");
     if (memchr(pt_serial_in_buffer, '\0', sizeof(pt_serial_in_buffer)) == NULL) return;
     if (sscanf(pt_serial_in_buffer, "%f %c", &angle, &extra) != 1 ||
-        !isfinite(angle) || angle < 0.0f || angle > 360.0f) return;
+        !isfinite(angle) || angle < 0.0f || angle > 180.0f) return;
 
     uint32_t irq_state = save_and_disable_interrupts();
     desired_angle = angle;
     restore_interrupts(irq_state);
     snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-             "Target angle = %.2f degrees\r\n", angle);
+             "Target angle = %.2f degrees%s\r\n", angle,
+             angle == 0.0f ? " (motor off)" : "");
 }
 
 static PT_THREAD (protothread_serial(struct pt *pt))
@@ -325,7 +329,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     PT_BEGIN(pt) ;
     while(1) {
         snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-                 "Target angle (0-360 degrees): ");
+                 "Target angle (0-180 degrees; 0 = motor off): ");
         serial_write ;
         serial_read ;
         handle_serial_angle();
