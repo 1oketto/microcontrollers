@@ -52,6 +52,7 @@
 #include "hardware/sync.h"
 #include "VGA/vga16_graphics_v3.h"
 #include "mpu6050.h"
+#include "pid_control.h"
 #include "pt_cornell_rp2040_v1_4.h"
 
 // We will start drawing at column 81
@@ -106,7 +107,7 @@ volatile int throttle = 10 ;
 // PWM wrap value and clock divide value
 // For a CPU rate of 150 MHz, this gives
 // a PWM frequency of 1 kHz.
-#define WRAPVAL 6000
+#define WRAPVAL PID_PWM_MAX
 // keep 6000 as the command maximum; count 0..5999 for a 6000-clock period.
 #define CLKDIV 25.0f
 
@@ -116,14 +117,10 @@ volatile int throttle = 10 ;
 // Variable to hold PWM slice number
 uint slice_num ;
 
-// PWM duty cycle
-volatile int control ;
+// Shared by the core 0 serial thread and PWM interrupt.
+static pid_settings_t pid_settings = PID_DEFAULT_SETTINGS;
+static pid_state_t pid_state;
 volatile int old_control ;
-
-// CLOSED-LOOP CONTROL: SERIAL INPUT SETS THE BIAS AND ANGLE ERROR ADJUSTS PWM
-// these are starting values
-float desired_angle = 180.0f ;
-float Kp = 1.0f ;
 
 void drawAxes() {
     // Draw the static aspects of the display
@@ -206,13 +203,9 @@ void on_pwm_wrap() {
     gyro_angle_delta = multfix15(gyro[2], zeropt001) ;
     complementary_angle = multfix15(complementary_angle - gyro_angle_delta, zeropt999) + multfix15(accel_angle, zeropt001);
 
-    // 5. CLOSED-LOOP CONTROL (FOR NOW): SERIAL INPUT SETS THE BIAS AND ANGLE ERROR ADJUSTS PWM 
-    // eventually will run the PID control loop at 1000/sec using the angle estimates from the complementary filter
-    float error = desired_angle - fix2float15(complementary_angle) ;
-    float motor_command = control + Kp * error ;
-    if (motor_command > WRAPVAL) motor_command = WRAPVAL ;
-    else if (motor_command < 0) motor_command = 0 ;
-    int pwm_on_time = (int)motor_command ;
+    // 5. PID at 1000 Hz: bias + proportional + integral + derivative.
+    int pwm_on_time = (int)pid_step(&pid_settings, &pid_state,
+                                   fix2float15(complementary_angle));
 
     // 6. Sets a hardware PWM signal using output-compare unit to control the motor using the command
     // Update duty cycle
@@ -305,20 +298,37 @@ static PT_THREAD (protothread_draw(struct pt *pt))
 //
 // THREAD 1: USER SERIAL INPUT
 //
+static void handle_serial_command(void) {
+    // The supplied serial reader can fill the entire array without a terminator.
+    if (memchr(pt_serial_in_buffer, '\0', sizeof(pt_serial_in_buffer)) == NULL) {
+        snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
+                 "Error: command too long.\r\n");
+        return;
+    }
+    pid_settings_t updated = pid_settings;
+    pid_command_result_t result = pid_command(pt_serial_in_buffer, &updated,
+        pt_serial_out_buffer, sizeof(pt_serial_out_buffer));
+    if (result != PID_COMMAND_NONE) {
+        uint32_t irq_state = save_and_disable_interrupts();
+        if (result == PID_COMMAND_UPDATE) pid_settings = updated;
+        // Clear accumulated I and D history whenever tuning changes.
+        pid_state = (pid_state_t){0};
+        restore_interrupts(irq_state);
+    }
+}
+
 static PT_THREAD (protothread_serial(struct pt *pt))
 {
     PT_BEGIN(pt) ;
-    static int test_in ;
+    snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
+             "PID serial control. Type help for commands.\r\n");
+    serial_write ;
     while(1) {
-        sprintf(pt_serial_out_buffer, "input a PWM bias (0-6000): ");
+        snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer), "pid> ");
         serial_write ;
-        // spawn a thread to do the non-blocking serial read
         serial_read ;
-        // convert input string to number
-        sscanf(pt_serial_in_buffer,"%d", &test_in) ;
-        if (test_in > 6000) continue ;
-        else if (test_in < 0) continue ;
-        else control = test_in ;
+        handle_serial_command();
+        serial_write ;
     }
     PT_END(pt) ;
 }
@@ -382,7 +392,7 @@ int main() {
     pwm_set_clkdiv(slice_num, CLKDIV) ;
 
     // This sets duty cycle
-    // match the initially zero control and motor_disp values.
+    // match the initially zero PWM bias and motor_disp values.
     pwm_set_chan_level(slice_num, PWM_CHAN_A, 0);
 
     // Start the channel
