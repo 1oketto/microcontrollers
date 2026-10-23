@@ -52,7 +52,6 @@
 #include "hardware/sync.h"
 #include "VGA/vga16_graphics_v3.h"
 #include "mpu6050.h"
-#include "pid_control.h"
 #include "pt_cornell_rp2040_v1_4.h"
 
 // We will start drawing at column 81
@@ -88,7 +87,7 @@ fix15 gz[PLOT_WIDTH] ;
 
 fix15 angle_history[PLOT_WIDTH] ;
 int motor_history[PLOT_WIDTH] ;
-// keep the tutorial names and 15.16 fixed-point angle representation
+// 15.16 fixed-point angle representation
 fix15 filtered_ax, filtered_ay ;
 fix15 accel_angle, gyro_angle_delta, complementary_angle ;
 // signed state persists between interrupts
@@ -107,7 +106,7 @@ volatile int throttle = 10 ;
 // PWM wrap value and clock divide value
 // For a CPU rate of 150 MHz, this gives
 // a PWM frequency of 1 kHz.
-#define WRAPVAL PID_PWM_MAX
+#define WRAPVAL 6000
 // keep 6000 as the command maximum; count 0..5999 for a 6000-clock period.
 #define CLKDIV 25.0f
 
@@ -117,10 +116,18 @@ volatile int throttle = 10 ;
 // Variable to hold PWM slice number
 uint slice_num ;
 
-// Shared by the core 0 serial thread and PWM interrupt.
-static pid_settings_t pid_settings = PID_DEFAULT_SETTINGS;
-static pid_state_t pid_state;
+// Proportional control: PWM counts per degree of angle error.
+volatile float Kp = 1.0f;
+// Serial settings only; integral and derivative control are disabled.
+volatile float Ki = 0.0f, Kd = 0.0f;
+volatile float desired_angle = 180.0f, pwm_bias = 0.0f;
 volatile int old_control ;
+
+static float calculate_control(float angle) {
+    float error = desired_angle - angle;
+    float output = pwm_bias + Kp * error;
+    return fmaxf(0.0f, fminf(WRAPVAL, output));
+}
 
 void drawAxes() {
     // Draw the static aspects of the display
@@ -163,7 +170,7 @@ void drawAxes() {
     setCursor(45, 225) ;
     writeString(screentext) ;
 
-    // top-right plot: complementary angle using the tutorial's 0..360 convention
+    // top-right plot: complementary angle using 0..360 convention
     drawHLine(395, 230, 5, CYAN) ;
     drawHLine(395, 155, 5, CYAN) ;
     drawHLine(395, 80, 5, CYAN) ;
@@ -183,7 +190,7 @@ void drawAxes() {
 }
 
 //
-// PID ISR: uses a PWM interrupt
+// Motor control ISR: uses a PWM interrupt
 // 
 void on_pwm_wrap() {
     // 1. Clear the interrupt flag that brought us here
@@ -203,9 +210,8 @@ void on_pwm_wrap() {
     gyro_angle_delta = multfix15(gyro[2], zeropt001) ;
     complementary_angle = multfix15(complementary_angle - gyro_angle_delta, zeropt999) + multfix15(accel_angle, zeropt001);
 
-    // 5. PID at 1000 Hz: bias + proportional + integral + derivative.
-    int pwm_on_time = (int)pid_step(&pid_settings, &pid_state,
-                                   fix2float15(complementary_angle));
+    // 5. proportional control at 1000 Hz: bias + Kp * angle error.
+    int pwm_on_time = (int)calculate_control(fix2float15(complementary_angle));
 
     // 6. Sets a hardware PWM signal using output-compare unit to control the motor using the command
     // Update duty cycle
@@ -299,32 +305,38 @@ static PT_THREAD (protothread_draw(struct pt *pt))
 // THREAD 1: USER SERIAL INPUT
 //
 static void handle_serial_command(void) {
-    // The supplied serial reader can fill the entire array without a terminator.
-    if (memchr(pt_serial_in_buffer, '\0', sizeof(pt_serial_in_buffer)) == NULL) {
-        snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-                 "Error: command too long.\r\n");
-        return;
+    char command[8], extra;
+    float value;
+    volatile float *parameter = NULL;
+    snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer), "Invalid command/value.\r\n");
+    if (memchr(pt_serial_in_buffer, '\0', sizeof(pt_serial_in_buffer)) == NULL) return;
+    if (sscanf(pt_serial_in_buffer, "%7s %f %c", command, &value, &extra) != 2) {
+        // A bare number still sets the PWM bias.
+        if (sscanf(pt_serial_in_buffer, "%f %c", &value, &extra) != 1) return;
+        strcpy(command, "bias");
     }
-    pid_settings_t updated = pid_settings;
-    pid_command_result_t result = pid_command(pt_serial_in_buffer, &updated,
-        pt_serial_out_buffer, sizeof(pt_serial_out_buffer));
-    if (result != PID_COMMAND_NONE) {
-        uint32_t irq_state = save_and_disable_interrupts();
-        if (result == PID_COMMAND_UPDATE) pid_settings = updated;
-        // Clear accumulated I and D history whenever tuning changes.
-        pid_state = (pid_state_t){0};
-        restore_interrupts(irq_state);
-    }
+    if (!isfinite(value) || value < 0.0f || value > 1000000.0f) return;
+    if (strcmp(command, "kp") == 0) parameter = &Kp;
+    else if (strcmp(command, "ki") == 0) parameter = &Ki;
+    else if (strcmp(command, "kd") == 0) parameter = &Kd;
+    else if (strcmp(command, "target") == 0 && value <= 360) parameter = &desired_angle;
+    else if (strcmp(command, "bias") == 0 && value <= WRAPVAL && value == truncf(value))
+        parameter = &pwm_bias;
+    if (parameter == NULL) return;
+
+    uint32_t irq_state = save_and_disable_interrupts();
+    *parameter = value;
+    restore_interrupts(irq_state);
+    snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer), "%s = %.4f%s\r\n",
+             command, value, (parameter == &Ki || parameter == &Kd) ? " (inactive: P-only control)" : "");
 }
 
 static PT_THREAD (protothread_serial(struct pt *pt))
 {
     PT_BEGIN(pt) ;
-    snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-             "PID serial control. Type help for commands.\r\n");
-    serial_write ;
     while(1) {
-        snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer), "pid> ");
+        snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
+                 "kp/ki/kd/target/bias <value>: ");
         serial_write ;
         serial_read ;
         handle_serial_command();
@@ -341,7 +353,6 @@ void core1_entry() {
     pt_add_thread(protothread_draw) ;
     pt_schedule_start ;
 }
-
 
 int main() {
 

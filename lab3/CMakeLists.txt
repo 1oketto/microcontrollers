@@ -30,8 +30,7 @@ add_executable(PWM_Demo)
 
 # must match with executable name and source file names
 target_sources(PWM_Demo PRIVATE
-    pwm-demo.c
-    pid_control.c
+    pwm_demo.c
     mpu6050.c
     VGA/vga16_graphics_v3.c
 )
