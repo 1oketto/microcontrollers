@@ -8,11 +8,13 @@
  * HARDWARE CONNECTIONS
  *   - GPIO 4 ---> PWM output
  * 
- * This also demonstration utilizes the MPU6050.
+ * (from imu_demo.c) This demonstration utilizes the MPU6050.
  * It gathers raw accelerometer/gyro measurements, scales
  * them, and plots them to the VGA display. The top plot
  * shows gyro measurements, bottom plot shows accelerometer
  * measurements.
+ * 
+ * on the right: top = beam angle, bottom = slow-passed motor command signal
  * 
  * HARDWARE CONNECTIONS
  *  - GPIO 16 ---> VGA Hsync
@@ -41,7 +43,7 @@
 #include "hardware/pwm.h"
 #include "hardware/irq.h"
 
-// Include custom libraries and additional IMU/VGA hardware libraries
+// include custom libraries and additional imu/vga hardware libraries
 #include "hardware/dma.h"
 #include "hardware/adc.h"
 #include "hardware/pio.h"
@@ -54,6 +56,8 @@
 
 // We will start drawing at column 81
 #define LEFT_EDGE 81 
+// place the checkpoint graphs in the right half of the display
+#define RIGHT_EDGE 401
 
 // Rescale the measurements for display
 #define OLD_RANGE 500.  // (+/- 250)
@@ -62,10 +66,13 @@
 #define OLD_MAX 250. 
 #define ACCEL_SCALE 120.0
 
+// x/y accelerometer components and rotation about sensor z
+#define PI 3.14159265358979323846
+
 // Place the plots
 #define TOP_PLOT_BOTTOM 230
 #define BOTTOM_PLOT_BOTTOM 430
-#define PLOT_WIDTH 530
+#define PLOT_WIDTH 230  // each column shows about 2.3 seconds at 100 saved samples/sec
 
 // Arrays in which raw measurements will be stored
 fix15 acceleration[3], gyro[3];
@@ -78,6 +85,14 @@ fix15 gx[PLOT_WIDTH] ;
 fix15 gy[PLOT_WIDTH] ;
 fix15 gz[PLOT_WIDTH] ;
 
+fix15 angle_history[PLOT_WIDTH] ;
+int motor_history[PLOT_WIDTH] ;
+// keep the tutorial names and 15.16 fixed-point angle representation
+fix15 filtered_ax, filtered_ay ;
+fix15 accel_angle, gyro_angle_delta, complementary_angle ;
+// signed state persists between interrupts
+static int motor_disp = 0 ;
+
 // Pointer to head of buffer
 volatile int head = 0 ;
 
@@ -86,13 +101,13 @@ char screentext[40];
 
 // draw speed
 volatile int threshold = 10 ;
-
 volatile int throttle = 10 ;
 
 // PWM wrap value and clock divide value
 // For a CPU rate of 150 MHz, this gives
 // a PWM frequency of 1 kHz.
 #define WRAPVAL 6000
+// keep 6000 as the command maximum; count 0..5999 for a 6000-clock period.
 #define CLKDIV 25.0f
 
 // GPIO we're using for PWM
@@ -105,10 +120,21 @@ uint slice_num ;
 volatile int control ;
 volatile int old_control ;
 
+// CLOSED-LOOP CONTROL: SERIAL INPUT SETS THE BIAS AND ANGLE ERROR ADJUSTS PWM
+// these are starting values
+float desired_angle = 180.0f ;
+float Kp = 1.0f ;
+
 void drawAxes() {
     // Draw the static aspects of the display
     setTextSize(1) ;
     setTextColor(WHITE);
+
+    // titles for the original sensor plots and the checkpoint plots
+    setCursor(82, 60) ; writeString("Gyro (deg/s)") ;
+    setCursor(82, 260) ; writeString("Accel (g)") ;
+    setCursor(402, 60) ; writeString("Beam angle (deg)") ;
+    setCursor(402, 260) ; writeString("Filtered command (PWM)") ;
 
     // Draw bottom plot
     drawHLine(75, 430, 5, CYAN) ;
@@ -139,23 +165,65 @@ void drawAxes() {
     sprintf(screentext, "-250") ;
     setCursor(45, 225) ;
     writeString(screentext) ;
+
+    // top-right plot: complementary angle using the tutorial's 0..360 convention
+    drawHLine(395, 230, 5, CYAN) ;
+    drawHLine(395, 155, 5, CYAN) ;
+    drawHLine(395, 80, 5, CYAN) ;
+    drawVLine(400, 80, 150, CYAN) ;
+    setCursor(365, 225) ; writeString("0") ;
+    setCursor(365, 150) ; writeString("180") ;
+    setCursor(365, 75) ; writeString("360") ;
+
+    // bottom-right plot: software-filtered motor command, 0..6000 counts
+    drawHLine(395, 430, 5, CYAN) ;
+    drawHLine(395, 355, 5, CYAN) ;
+    drawHLine(395, 280, 5, CYAN) ;
+    drawVLine(400, 280, 150, CYAN) ;
+    setCursor(365, 425) ; writeString("0") ;
+    setCursor(365, 350) ; writeString("3000") ;
+    setCursor(365, 275) ; writeString("6000") ;
 }
 
-// PWM interrupt service routine
+//
+// PID ISR: uses a PWM interrupt
+// 
 void on_pwm_wrap() {
-    // Clear the interrupt flag that brought us here
+    // 1. Clear the interrupt flag that brought us here
     pwm_clear_irq(pwm_gpio_to_slice_num(PWM_OUT));
-    // Update duty cycle
-    if (control!=old_control) {
-        old_control = control ;
-        pwm_set_chan_level(slice_num, PWM_CHAN_A, control);
-    }
-
-    // Read the IMU
+    // 2. Read the IMU
     // NOTE! This is in 15.16 fixed point. Accel in g's, gyro in deg/s
     // If you want these values in floating point, call fix2float15() on
     // the raw measurements.
     mpu6050_read_raw(acceleration, gyro);
+
+    // 3. low-pass the accelerometer measurements before calculating angle
+    filtered_ax = filtered_ax + ((acceleration[0] - filtered_ax)>>4);
+    filtered_ay = filtered_ay + ((acceleration[1] - filtered_ay)>>4);
+
+    // 4. estimates angle using complementary filter of accelerometer and gyro measurements
+    accel_angle = multfix15(float2fix15(atan2(-filtered_ax, filtered_ay) + PI), oneeightyoverpi);
+    gyro_angle_delta = multfix15(gyro[2], zeropt001) ;
+    complementary_angle = multfix15(complementary_angle - gyro_angle_delta, zeropt999) + multfix15(accel_angle, zeropt001);
+
+    // 5. CLOSED-LOOP CONTROL (FOR NOW): SERIAL INPUT SETS THE BIAS AND ANGLE ERROR ADJUSTS PWM 
+    // eventually will run the PID control loop at 1000/sec using the angle estimates from the complementary filter
+    float error = desired_angle - fix2float15(complementary_angle) ;
+    float motor_command = control + Kp * error ;
+    if (motor_command > WRAPVAL) motor_command = WRAPVAL ;
+    else if (motor_command < 0) motor_command = 0 ;
+    int pwm_on_time = (int)motor_command ;
+
+    // 6. Sets a hardware PWM signal using output-compare unit to control the motor using the command
+    // Update duty cycle
+    if (pwm_on_time!=old_control) {
+        old_control = pwm_on_time ;
+        pwm_set_chan_level(slice_num, PWM_CHAN_A, pwm_on_time);
+    }
+
+    // low-pass the displayed motor command, every 1 khz pwm interrupt
+    // the exact integer filter can settle up to 63 counts below a rising target
+    motor_disp = motor_disp + ((pwm_on_time - motor_disp)>>6);
 
     // Increment drawspeed controller
     throttle += 1 ;
@@ -174,12 +242,19 @@ void on_pwm_wrap() {
         gy[head] = gyro[1] ;
         gz[head] = gyro[2] ;
 
+        // replace oldest data with the measured angle and filtered motor command
+        angle_history[head] = complementary_angle ;
+        motor_history[head] = motor_disp ;
+
         // Move the pointer to the oldest data
         head = ((head+1) == PLOT_WIDTH) ? 0 : (head + 1) ;
 
     }
 }
 
+//
+// THREAD 2: VGA DRAWING
+//
 static PT_THREAD (protothread_draw(struct pt *pt))
 {
     PT_BEGIN(pt) ;
@@ -215,6 +290,11 @@ static PT_THREAD (protothread_draw(struct pt *pt))
                 (int)(NEW_RANGE*((float)((fix2float15(gy[start]))-OLD_MIN)/OLD_RANGE))), RED) ;
             drawPixel(LEFT_EDGE + i, (TOP_PLOT_BOTTOM -
                 (int)(NEW_RANGE*((float)((fix2float15(gz[start]))-OLD_MIN)/OLD_RANGE))), GREEN) ;
+            // draw the checkpoint signals beside the original sensor traces
+            drawPixel(RIGHT_EDGE + i, (TOP_PLOT_BOTTOM -
+                (int)(NEW_RANGE * fix2float15(angle_history[start]) / 360.0f)), WHITE) ;
+            drawPixel(RIGHT_EDGE + i, (BOTTOM_PLOT_BOTTOM -
+                (int)(NEW_RANGE * (float)motor_history[start] / WRAPVAL)), GREEN) ;
             start = ((start+1)==PLOT_WIDTH) ? 0 : (start+1) ;
         }
     }
@@ -222,13 +302,15 @@ static PT_THREAD (protothread_draw(struct pt *pt))
     PT_END(pt) ;
 }
 
-// User input thread
+//
+// THREAD 1: USER SERIAL INPUT
+//
 static PT_THREAD (protothread_serial(struct pt *pt))
 {
     PT_BEGIN(pt) ;
     static int test_in ;
     while(1) {
-        sprintf(pt_serial_out_buffer, "input a duty cycle (0-6000): ");
+        sprintf(pt_serial_out_buffer, "input a PWM bias (0-6000): ");
         serial_write ;
         // spawn a thread to do the non-blocking serial read
         serial_read ;
@@ -250,9 +332,10 @@ void core1_entry() {
     pt_schedule_start ;
 }
 
+
 int main() {
 
-    // Overclock CPU to 150 MHz for the VGA driver
+    // overclock cpu to 150 mhz for the vga driver
     set_sys_clock_khz(150000, true) ;
 
     // Initialize stdio
@@ -271,6 +354,12 @@ int main() {
     mpu6050_reset();
     mpu6050_read_raw(acceleration, gyro);
 
+    // initialize the complementary angle from the accelerometer
+    filtered_ax = acceleration[0];
+    filtered_ay = acceleration[1];
+    accel_angle = multfix15(float2fix15(atan2(-filtered_ax, filtered_ay) + PI), oneeightyoverpi);
+    complementary_angle = accel_angle;
+
     ////////////////////////////////////////////////////////////////////////
     ///////////////////////// PWM CONFIGURATION ////////////////////////////
     ////////////////////////////////////////////////////////////////////////
@@ -288,11 +377,13 @@ int main() {
     irq_set_enabled(PWM_IRQ_WRAP, true);
 
     // This section configures the period of the PWM signals
-    pwm_set_wrap(slice_num, WRAPVAL) ;
+    // 150 mhz / (25 * 6000) = exactly 1000 pwm wraps per second.
+    pwm_set_wrap(slice_num, WRAPVAL - 1) ;
     pwm_set_clkdiv(slice_num, CLKDIV) ;
 
     // This sets duty cycle
-    pwm_set_chan_level(slice_num, PWM_CHAN_A, 3000);
+    // match the initially zero control and motor_disp values.
+    pwm_set_chan_level(slice_num, PWM_CHAN_A, 0);
 
     // Start the channel
     pwm_set_mask_enabled((1u << slice_num));
