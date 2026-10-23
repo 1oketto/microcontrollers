@@ -1,10 +1,8 @@
 /**
  * Hunter Adams (vha3@cornell.edu)
  *
- * Ball storage grows on demand; the initial count is configurable at build time.
- * Both cores update physics and render disjoint scanlines.
- * The rotary encoder controls ball count or bounciness; click to switch.
- * Encoder button: between GPIO 15 (input) and GPIO 12 (output low).
+ * This demonstration drops multiple balls through a 16-row Galton board.
+ * The rotary encoder controls the number of animated balls.
  *
  * HARDWARE CONNECTIONS
   - GPIO 16 ---> VGA Hsync
@@ -15,13 +13,14 @@
   - GPIO 21 ---> 330 ohm resistor ---> VGA-Red
   - RP2040 GND ---> VGA-GND
  *
- * RESOURCES USED
- *  - PIO0 state machines 0/1 for sync and PIO1 state machine 0 for pixels
- *  - One VGA DMA channel and two audio DMA channels
- *  - 76.8 KB of RAM for two monochrome framebuffers
- *
+ * Pico 2 resources: 300 MHz CPU, 1.30 V core supply, PIO0 state machines 0/1
+ * for sync, PIO1 state machine 0 for pixels, one VGA DMA channel, two audio DMA
+ * channels, an audio DMA timer, and a core-1 alarm pool for button debounce.
+ * Two 1-bit framebuffers use 76,800 bytes; coordinates plus state use 9 bytes
+ * per ball. Both cores update physics and then render disjoint scanlines.
  */
 
+// VGA graphics
 #include "VGA/vga16_graphics_v3.h"
 #include "board_config.h"
 #include <stdio.h>
@@ -42,7 +41,7 @@
 #include "hardware/vreg.h"
 #include "pt_cornell_rp2040_v1_4.h"
 
-// Number of samples per period in sine table
+// Samples in one collision sound
 #define sine_table_size 256
 
 // Table of values to be sent to DAC
@@ -65,11 +64,11 @@ const uint32_t transfer_count = sine_table_size;
 
 static int data_chan;
 static int ctrl_chan;
-// boid collisions produce events; the sound thread consumes them.
+// Count collisions here so the sound thread can play them later.
 static uint32_t peg_sound_events = 0; // how many collisions have happened
-// played_peg_events = how many collisions have happened
-// ^^ together they keep track of whether sound has been played for a collision
-// and collisions aren't lost while DMA is busy
+// Keep pending sounds in the count while DMA is busy.
+
+// Frame timing and starting ball count
 
 // 60 fps gives each animation frame 16,666 microseconds.
 #define FRAME_BUDGET_US (1000000u / 60u)
@@ -83,7 +82,9 @@ static uint32_t peg_sound_events = 0; // how many collisions have happened
 _Static_assert(LAB_INITIAL_BALL_COUNT >= 0, "Initial ball count cannot be negative");
 _Static_assert(LAB_INITIAL_BALL_COUNT <= INT_MAX, "Initial ball count exceeds the supported count type");
 
-// rotary encoder GPIOs (C_PIN is connected to GND pin 18)
+// Rotary encoder and button
+
+// Encoder A/B inputs; connect the common terminal to ground.
 #define A_PIN 13
 #define B_PIN 14
 #define BUTTON_PIN 15
@@ -98,8 +99,7 @@ static volatile int bounciness_q15 = (5 * 32768 + 5) / 10;
 static volatile bool statistics_reset_pending = false;
 static bool ball_allocation_failed = false;
 
-// GPIO edges restart the debounce interval; a timer IRQ checks the result.
-// A held button toggles only once, and must be released before another click.
+// Wait for the button to settle so one press only counts once.
 #define BUTTON_DEBOUNCE_US 20000u
 static volatile uint32_t button_last_edge_us;
 static volatile bool button_alarm_pending = false;
@@ -110,6 +110,7 @@ static int64_t debounceButton(alarm_id_t id, void *user_data)
 {
     (void)id;
     (void)user_data;
+    // Wait 20 ms after the last edge to ignore switch bounce.
     uint32_t elapsed = (uint32_t)(time_us_32() - button_last_edge_us);
     if (elapsed < BUTTON_DEBOUNCE_US)
         return BUTTON_DEBOUNCE_US - elapsed;
@@ -124,6 +125,7 @@ static int64_t debounceButton(alarm_id_t id, void *user_data)
 }
 
 // Button GPIO ISR runs only on core 1.
+
 static void button_gpio_callback(uint gpio, uint32_t events)
 {
     if (gpio != BUTTON_PIN ||
@@ -144,6 +146,7 @@ void gpio_callback(uint gpio, uint32_t events)
 {
     if (gpio != A_PIN || !(events & GPIO_IRQ_EDGE_FALL))
         return;
+    // The button switches between changing ball count and bounciness.
     if (edit_bounciness) {
         int level = bounciness_level + (gpio_get(B_PIN) ? 1 : -1);
         if (level < 0) level = 0;
@@ -168,12 +171,15 @@ void gpio_callback(uint gpio, uint32_t events)
     }
 }
 
+// Collision sounds
+
 static PT_THREAD(protothread_sound(struct pt *pt))
 {
     static uint32_t played_peg_events = 0; // how many collision sounds we've already played
     PT_BEGIN(pt);
     while (1)
     {
+        // Finish the last sound before starting another one.
         if (played_peg_events != peg_sound_events &&
             !dma_channel_is_busy(ctrl_chan) &&
             !dma_channel_is_busy(data_chan) && !spi_is_busy(SPI_PORT))
@@ -189,14 +195,14 @@ static PT_THREAD(protothread_sound(struct pt *pt))
     PT_END(pt);
 }
 
-// ========================================
-// === boidS AND PEGS !!!!
-// ========================================
+// Fixed-point math
 static const char color = WHITE;
 
 typedef signed int fix15;
+
 static inline fix15 multiplyFix15(fix15 a, fix15 b)
 {
+    // Handle the sign separately so negative values round the same way.
     int64_t product = (int64_t)a * b;
     uint64_t magnitude = product < 0 ? 0u - (uint64_t)product : (uint64_t)product;
     fix15 result = (fix15)(magnitude >> 15);
@@ -210,6 +216,8 @@ static inline fix15 multiplyFix15(fix15 a, fix15 b)
 #define fix2int15(a) ((int)(a >> 15))
 #define char2fix15(a) int2fix15(a)
 #define divfix(a, b) ((fix15)(((int64_t)(a) * 32768) / (int64_t)(b)))
+
+// Board layout
 
 // global variables for boids and pegs. positions are pixels; velocities are pixels/frame.
 #define boid_RADIUS BOARD_BALL_RADIUS
@@ -226,7 +234,7 @@ static inline fix15 multiplyFix15(fix15 a, fix15 b)
 #define BOUNCINESS ((fix15)bounciness_q15)
 #define RANDOM_LATERAL_KICK_Q15 16384 // 0.5 pixels/frame, with a fair random sign.
 
-// Independent ablations for on-board measurements; default to optimized paths.
+// Turn these on to compare against the slower collision checks.
 #ifndef LAB_FULL_PEG_SCAN
 #define LAB_FULL_PEG_SCAN 0
 #endif
@@ -246,6 +254,7 @@ static void initPegs(void)
     int peg = 0;
     for (int row = 0; row < PEG_ROWS; ++row)
     {
+        // Each row has one more peg than the row above it.
         for (int col = 0; col <= row; ++col)
         {
             peg_x[peg] = PEG_X + ((col << 1) - row) * int2fix15(PEG_HORIZONTAL_SPACING / 2);
@@ -255,9 +264,10 @@ static void initPegs(void)
     }
 }
 
-// Coordinates remain word-aligned; one state byte per ball is kept in a sidecar.
-// Positions have 1/32-pixel precision and velocities 1/1024. Signed positions
-// allow screen exits; 32 pixels/frame covers normal Galton-board speeds.
+// Ball storage
+
+// Smaller values save RAM: 8 bytes for position/velocity and 1 for the peg state.
+// Positions use 1/32 pixel steps; velocities use 1/1024 pixel/frame steps.
 typedef struct
 {
     int16_t x, y;   // Q5, range -1024 to just below 1024 pixels.
@@ -269,15 +279,13 @@ _Static_assert(PEG_COUNT < HISTOGRAM_RECORDED,
                "Peg indices must not overlap boid state sentinels");
 _Static_assert(sizeof(boid) == 8, "Ball coordinates must stay word-aligned");
 static boid *boids;
-// The state sidecar makes the allocation exactly 9 bytes per ball without
-// forcing unaligned coordinate loads from a packed 9-byte struct.
+// Keep the state bytes separate so each ball uses 9 bytes without awkward alignment.
 static uint8_t *boid_state;
 static void *boid_pool;
 static int boid_capacity;
 static int boid_count = 0;
 
-// Round to the compact format. Saturation keeps off-screen trajectories from
-// wrapping back into the board if a ball travels far beyond the display.
+// Round back to the smaller format and clamp so off-screen positions cannot wrap.
 static inline int16_t packFixed(fix15 value, unsigned shift)
 {
     int32_t packed = (value + (1 << (shift - 1))) >> shift;
@@ -286,9 +294,11 @@ static inline int16_t packFixed(fix15 value, unsigned shift)
     return (int16_t)packed;
 }
 
+// Counters and shared core data
+
 static uint64_t total_fallen = 0;
 
-// Each core owns its deltas and RNG; core 0 merges deltas after completion.
+// Each core keeps its own counts and random seed; combine the counts after the frame.
 typedef struct {
     uint32_t rng;
     uint32_t collisions;
@@ -313,8 +323,10 @@ static uint64_t profile_distance_checks;
 static unsigned profile_frames;
 #endif
 
+// Spawning balls and changing the count
 static uint32_t nextRandom(uint32_t *state)
 {
+    // Cheap random numbers; each core uses its own seed.
     uint32_t value = *state;
     value ^= value << 13;
     value ^= value >> 17;
@@ -335,9 +347,9 @@ static void dropboid(boid *ball, uint8_t *state, uint32_t *rng)
     *state = NO_PEG;
 }
 
-// Resize only between worker jobs so neither core can retain a stale ball pointer.
 static void syncboidCount(void)
 {
+    // Resize between frames so core 1 is not using an old pointer.
     int requested = rotary_count;
     if (requested < 0) requested = 0;
     if (requested > boid_capacity) {
@@ -346,6 +358,7 @@ static void syncboidCount(void)
         if ((size_t)requested <= SIZE_MAX / bytes_per_ball)
             resized = realloc(boid_pool, (size_t)requested * bytes_per_ball);
         if (resized == NULL) {
+            // Out of RAM: keep using the space we already have.
             ball_allocation_failed = true;
             uint32_t irq_state = save_and_disable_interrupts();
             if (rotary_count == requested)
@@ -353,6 +366,7 @@ static void syncboidCount(void)
             restore_interrupts(irq_state);
             requested = boid_capacity;
         } else {
+            // Move the state bytes after the larger position/velocity array.
             size_t old_state_offset = (size_t)boid_capacity * sizeof(*boids);
             size_t new_state_offset = (size_t)requested * sizeof(*boids);
             if (boid_capacity > 0)
@@ -371,10 +385,9 @@ static void syncboidCount(void)
     boid_count = requested;
 }
 
-// Consume the encoder request outside the ISR. Protect the read-and-clear
-// so an interrupt cannot overwrite a newly requested reset.
 static void resetStatisticsIfRequested(void)
 {
+    // Read and clear together so an encoder interrupt cannot lose a reset.
     uint32_t irq_state = save_and_disable_interrupts();
     bool reset = statistics_reset_pending;
     statistics_reset_pending = false;
@@ -385,8 +398,8 @@ static void resetStatisticsIfRequested(void)
     }
 }
 
-// Pico 2 has hardware floating-point square root. Use it for an initial root,
-// then correct against the exact integer square to retain Q15 collision results.
+// Ball physics
+
 static fix15 distanceFix15(fix15 dx, fix15 dy)
 {
     uint64_t squared = (uint64_t)((int64_t)dx * dx) +
@@ -405,6 +418,7 @@ static fix15 distanceFix15(fix15 dx, fix15 dy)
     }
 #else
     float fx = (float)dx, fy = (float)dy;
+    // Get a fast estimate, then fix any rounding error with integer checks.
     uint32_t root = (uint32_t)sqrtf(fx * fx + fy * fy);
     while ((uint64_t)root * root > squared) --root;
     while ((uint64_t)(root + 1) * (root + 1) <= squared) ++root;
@@ -412,8 +426,6 @@ static fix15 distanceFix15(fix15 dx, fix15 dy)
     return (fix15)root;
 }
 
-// Estimate a Q15 normal with the FPU, then correct integer products to match
-// signed division exactly. This avoids software 64-bit division per component.
 static inline fix15 normalComponent(fix15 component, fix15 distance, float scale)
 {
 #if LAB_REFERENCE_NORMAL
@@ -422,6 +434,7 @@ static inline fix15 normalComponent(fix15 component, fix15 distance, float scale
 #else
     uint32_t magnitude = component < 0 ? (uint32_t)-component : (uint32_t)component;
     uint64_t numerator = (uint64_t)magnitude * 32768u;
+    // Estimate first to avoid a slow 64-bit divide, then correct the result.
     uint32_t quotient = (uint32_t)((float)magnitude * scale);
     uint64_t product = (uint64_t)quotient * (uint32_t)distance;
     while (product > numerator) { --quotient; product -= distance; }
@@ -446,6 +459,7 @@ static inline fix15 collisionClearance(fix15 normal)
 static void updateboid(boid *ball, uint8_t *ball_state,
                        physics_state *state, fix15 bounciness)
 {
+    // Below the pegs, only update the fall until the ball leaves the screen.
     if (*ball_state == HISTOGRAM_RECORDED) {
         fix15 y = (fix15)ball->y * 1024 + (fix15)ball->vy * 32;
         if (y > int2fix15(480 + boid_RADIUS)) {
@@ -478,16 +492,15 @@ static void updateboid(boid *ball, uint8_t *ball_state,
     fix15 x = (fix15)ball->x * 1024 + vx;
     fix15 y = (fix15)ball->y * 1024 + vy;
 
-    // Conservative lower bounds preserve the full scan's row order.
-    // Later rows test the current position after collision correction.
+    // Start near the ball instead of checking every peg row.
+    // Keep checking rows in order since a collision can move the ball.
 #if LAB_FULL_PEG_SCAN
     int first_row = 0;
 #else
     int first_row = (fix2int15(y) - fix2int15(PEG_Y) - radius) / PEG_VERTICAL_SPACING;
     if (first_row < 0) first_row = 0;
 #endif
-    // A recorded ball has already cleared the bottom contact boundary; its
-    // later motion cannot change its histogram bin.
+
     for (int row = first_row; row < PEG_ROWS; ++row)
     {
 #if LAB_COLLISION_PROFILE
@@ -502,8 +515,7 @@ static void updateboid(boid *ball, uint8_t *ball_state,
         if (row_dy <= -int2fix15(radius)) break;
         if (row_dy >= int2fix15(radius + PEG_VERTICAL_SPACING)) break;
         if (row_dy >= int2fix15(radius)) continue;
-        // Peg centers in a row are 38 pixels apart, while the contact
-        // diameter is only 20 pixels, so at most the nearest peg can overlap.
+        // The pegs are far enough apart that only the nearest one can be hit.
         fix15 horizontal_offset = x - peg_x[row_start];
         int nearest_col = (horizontal_offset + int2fix15(PEG_HORIZONTAL_SPACING / 2))
                           / int2fix15(PEG_HORIZONTAL_SPACING);
@@ -527,14 +539,13 @@ static void updateboid(boid *ball, uint8_t *ball_state,
 #if LAB_COLLISION_PROFILE
                 ++state->distance_checks;
 #endif
+                // Reject misses before doing the square root.
                 int64_t distance_squared = (int64_t)dx * dx + (int64_t)dy * dy;
                 if (distance_squared < (int64_t)collision_distance * collision_distance)
                 {
                     fix15 distance = distanceFix15(dx, dy);
-                    // Normalize by the ACTUAL distance, which varies during penetration.
-                    // The combined radius is not a power of two, so dx/distance
-                    // cannot be replaced with a bit shift.
-                    // Coincident centers use an upward normal to avoid division by zero.
+                    // Use the actual distance for the bounce direction.
+                    // If the centers match, point upward to avoid dividing by zero.
                     float normal_scale = distance > 0 ? 32768.0f / (float)distance : 0.0f;
                     fix15 normal_x = distance > 0 ? normalComponent(dx, distance, normal_scale) : 0;
                     fix15 normal_y = distance > 0 ? normalComponent(dy, distance, normal_scale) : -int2fix15(1);
@@ -553,6 +564,7 @@ static void updateboid(boid *ball, uint8_t *ball_state,
                             ++state->collisions;
                             vx = dampVelocity(vx, bounciness);
                             vy = dampVelocity(vy, bounciness);
+                            // A small random kick helps spread the paths left and right.
                             vx += (nextRandom(&state->rng) & 0x80000000u)
                                 ? RANDOM_LATERAL_KICK_Q15
                                 : -RANDOM_LATERAL_KICK_Q15;
@@ -596,6 +608,7 @@ static void updateboid(boid *ball, uint8_t *ball_state,
 
 static void updateRange(int begin, int end, physics_state *state)
 {
+    // Reset this core's counts before updating its share of the balls.
     state->collisions = 0;
     state->fallen = 0;
 #if LAB_COLLISION_PROFILE
@@ -609,6 +622,8 @@ static void updateRange(int begin, int end, physics_state *state)
         updateboid(&boids[i], &boid_state[i], state, bounciness);
 }
 
+// Splitting work between the cores
+
 static void drawBallRows(unsigned parity);
 
 static void core1_entry(void)
@@ -617,6 +632,7 @@ static void core1_entry(void)
     gpio_set_irq_enabled_with_callback(BUTTON_PIN,
         GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true, button_gpio_callback);
     while (true) {
+        // Core 0 tells us when to update physics or draw.
         sem_acquire_blocking(&physics_start);
         if (worker_draw)
             drawBallRows(1);
@@ -628,6 +644,7 @@ static void core1_entry(void)
 
 static void mergePhysics(void)
 {
+    // Both cores finished, so we can add their counts together now.
     for (int core = 0; core < 2; ++core) {
         peg_sound_events += physics[core].collisions;
         total_fallen += physics[core].fallen;
@@ -644,8 +661,9 @@ static void mergePhysics(void)
 #endif
 }
 
-// Alternate scanlines give both cores disjoint framebuffer bytes, even for
-// overlapping balls. All physics must finish before either renderer reads them.
+// Drawing the board and stats
+
+// One core draws even rows and the other draws odd rows, so they never write the same byte.
 static void drawBallRows(unsigned parity)
 {
     for (int row = 0; row < PEG_ROWS; ++row) {
@@ -657,8 +675,8 @@ static void drawBallRows(unsigned parity)
         }
     }
 
-    // An exact-key cache skips redundant stamps when many balls overlap.
-    // Hash collisions merely cause another draw; they never hide another ball.
+    // Skip drawing the same ball position twice.
+    // If two positions share a cache slot, we just draw again.
     static uint32_t drawn_centers[2][256];
     uint32_t *cache = drawn_centers[parity];
     memset(cache, 0xff, sizeof(drawn_centers[0]));
@@ -669,8 +687,7 @@ static void drawBallRows(unsigned parity)
         if (x >= -BOARD_BALL_DRAW_RADIUS && x <= 639 + BOARD_BALL_DRAW_RADIUS &&
             y >= -BOARD_BALL_DRAW_RADIUS && y <= 479 + BOARD_BALL_DRAW_RADIUS) {
 #if BOARD_BALL_DRAW_RADIUS == 0
-            // A one-pixel sprite touches only its center scanline, so the
-            // other core can skip its cache and stamp work entirely.
+            // A one-pixel ball only needs the core that owns its row.
             if (((unsigned)y & 1u) != parity) continue;
 #endif
             uint32_t key = ((uint32_t)(y + BOARD_BALL_DRAW_RADIUS) << 10) |
@@ -683,7 +700,7 @@ static void drawBallRows(unsigned parity)
     }
 }
 
-// draw the stats: # boids being animated, total # of boids fallen since reset, and time since boot
+// Show the ball count, total fallen, bounciness, and time.
 static void drawStats(void)
 {
     static char ball_text[48], fallen_text[64], bounce_text[32], time_text[64];
@@ -691,6 +708,7 @@ static void drawStats(void)
     static uint64_t last_fallen = UINT64_MAX, last_seconds = UINT64_MAX;
     uint64_t seconds = time_us_64() / 1000000u;
     int bounciness = bounciness_q15;
+    // Only reformat the numbers when they change.
     if (boid_count != last_count) {
         snprintf(ball_text, sizeof(ball_text), "%d", boid_count);
         last_count = boid_count;
@@ -713,7 +731,7 @@ static void drawStats(void)
     }
     setTextSize(1);
     setTextColor2(WHITE, BLACK);
-    // Separate selection marker from the fixed left edge of every label.
+    // Put the arrow next to the setting the encoder is changing.
     setCursor(10, edit_bounciness ? 30 : 10);
     writeString(">");
     setCursor(22, 10);
@@ -745,6 +763,7 @@ static void drawHistogram(void)
     static int last_count[HISTOGRAM_BINS];
     const int height = 98;
     const int baseline = 463; // Leave room below the bars for bin totals.
+    // Scale all bars using the tallest bin.
     int max_count = 0;
     for (int i = 0; i < HISTOGRAM_BINS; ++i)
         if (histogram[i] > max_count)
@@ -771,6 +790,8 @@ static void drawHistogram(void)
     }
 }
 
+// Main animation loop
+
 // Animation on core 0
 static PT_THREAD(protothread_anim(struct pt *pt))
 {
@@ -784,13 +805,14 @@ static PT_THREAD(protothread_anim(struct pt *pt))
 
     while (1)
     {
-        // Wait for the signal that the buffer's changed
+        // Wait until VGA gives us a buffer to draw into.
         PT_YIELD_UNTIL(pt, draw_start_signal());
         frame_start_us = draw_frame_start_us();
         clearRegion(0, 480, BLACK);
-        // The previous worker has completed before any resize or new drop.
+        // Both cores are done with the old frame, so resizing is safe here.
         syncboidCount();
         frame_bounciness = BOUNCINESS;
+        // Core 0 takes the first half; core 1 takes the second half.
         split = boid_count / 2;
         worker_begin = split;
         worker_end = boid_count;
@@ -799,6 +821,7 @@ static PT_THREAD(protothread_anim(struct pt *pt))
         updateRange(0, split, &physics[0]);
         PT_YIELD_UNTIL(pt, sem_try_acquire(&physics_done));
         mergePhysics();
+        // Physics is done. Now split the drawing by even/odd screen rows.
         worker_draw = true;
         sem_release(&physics_start);
         drawBallRows(0);
@@ -808,8 +831,8 @@ static PT_THREAD(protothread_anim(struct pt *pt))
         drawHistogram();
         elapsed_us = (uint32_t)(time_us_32() - frame_start_us);
         missed_deadline = elapsed_us > FRAME_BUDGET_US || draw_frame_expired();
-        gpio_put(PICO_DEFAULT_LED_PIN, missed_deadline);
-        vga_frame_complete(); // No framebuffer writes until the next acquisition.
+        gpio_put(PICO_DEFAULT_LED_PIN, missed_deadline); // LED on if the frame took too long.
+        vga_frame_complete(); // Done drawing until VGA gives us the next buffer.
 #if LAB_COLLISION_PROFILE
         if (profile_frames >= 120) {
             printf("COLLISION_PROFILE,%u,%llu,%llu,%llu\n", profile_frames,
@@ -828,18 +851,14 @@ static PT_THREAD(protothread_anim(struct pt *pt))
 
 } // animation thread
 
-// ========================================
-// === main
-// ========================================
-// USE ONLY C-sdk library
+// Setup
 int main()
 {
-    // Core DVDD, NOT the 3.3 V I/O rail. Keep the SDK voltage limit enabled.
-    // Use the known-good clock; the 400 MHz configuration lost VGA sync.
+    // Use 300 MHz at 1.30 V core voltage; 400 MHz lost VGA sync.
     vreg_set_voltage(VREG_VOLTAGE_1_30);
     sleep_ms(10);
     set_sys_clock_khz(300000, true);
-    // initialize stio
+    // Initialize standard I/O.
     stdio_init_all();
 
     gpio_init(PICO_DEFAULT_LED_PIN);
@@ -872,11 +891,9 @@ int main()
     sem_init(&physics_done, 0, 1);
     multicore_launch_core1(core1_entry);
 
-    // ========================================
-    // === DMA STUFF BELOW !!!
-    // ========================================
+    // Set up the sound waveform and DMA.
 
-    // precommpute juicy thump ;)
+    // Precompute the decaying waveform once; contacts only queue playback.
     for (int i = 0; i < sine_table_size; i++)
     {
         float t = (float)i / 44000.0f; // 44,000 samples/s
@@ -895,7 +912,7 @@ int main()
     spi_set_format(SPI_PORT, 16, 0, 0, 0);
 
     // Map SPI signals to GPIO ports
-    // LDAC must be tied low btw
+    // Tie LDAC low so the DAC latches each sample.
     gpio_set_function(PIN_CS, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);

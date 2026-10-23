@@ -1,0 +1,3 @@
+[submodule "Hunter-Adams-RP2040-Demos"]
+	path = Hunter-Adams-RP2040-Demos
+	url = https://github.com/vha3/Hunter-Adams-RP2040-Demos.git
