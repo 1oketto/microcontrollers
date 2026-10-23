@@ -54,6 +54,18 @@
 #include "mpu6050.h"
 #include "pt_cornell_rp2040_v1_4.h"
 
+// TUNING PARAMETERS: edit these values, then rebuild and flash.
+volatile float Kp = 1.0f;            // PWM counts per degree of angle error
+volatile float pwm_bias = 0.0f;      // Baseline motor command (0..6000)
+volatile float desired_angle = 180.0f; // Startup target; serial input updates it
+// Reserved gains: unused while control is proportional-only.
+volatile float Ki = 0.0f, Kd = 0.0f;
+#define ACCEL_FILTER_SHIFT 4        // Accel smoothing: 1/16 per sample
+#define MOTOR_FILTER_SHIFT 6        // VGA motor-command smoothing: 1/64 per sample
+// 150 MHz / (25 * 6000) = 1 kHz. PWM counter runs from 0 to WRAPVAL-1.
+#define WRAPVAL 6000
+#define CLKDIV 25.0f
+
 // We will start drawing at column 81
 #define LEFT_EDGE 81 
 // place the checkpoint graphs in the right half of the display
@@ -103,24 +115,12 @@ char screentext[40];
 volatile int threshold = 10 ;
 volatile int throttle = 10 ;
 
-// PWM wrap value and clock divide value
-// For a CPU rate of 150 MHz, this gives
-// a PWM frequency of 1 kHz.
-#define WRAPVAL 6000
-// keep 6000 as the command maximum; count 0..5999 for a 6000-clock period.
-#define CLKDIV 25.0f
-
 // GPIO we're using for PWM
 #define PWM_OUT 4
 
 // Variable to hold PWM slice number
 uint slice_num ;
 
-// Proportional control: PWM counts per degree of angle error.
-volatile float Kp = 1.0f;
-// Serial settings only; integral and derivative control are disabled.
-volatile float Ki = 0.0f, Kd = 0.0f;
-volatile float desired_angle = 180.0f, pwm_bias = 0.0f;
 volatile int old_control ;
 
 static float calculate_control(float angle) {
@@ -202,8 +202,8 @@ void on_pwm_wrap() {
     mpu6050_read_raw(acceleration, gyro);
 
     // 3. low-pass the accelerometer measurements before calculating angle
-    filtered_ax = filtered_ax + ((acceleration[0] - filtered_ax)>>4);
-    filtered_ay = filtered_ay + ((acceleration[1] - filtered_ay)>>4);
+    filtered_ax = filtered_ax + ((acceleration[0] - filtered_ax)>>ACCEL_FILTER_SHIFT);
+    filtered_ay = filtered_ay + ((acceleration[1] - filtered_ay)>>ACCEL_FILTER_SHIFT);
 
     // 4. estimates angle using complementary filter of accelerometer and gyro measurements
     accel_angle = multfix15(float2fix15(atan2(-filtered_ax, filtered_ay) + PI), oneeightyoverpi);
@@ -221,8 +221,8 @@ void on_pwm_wrap() {
     }
 
     // low-pass the displayed motor command, every 1 khz pwm interrupt
-    // the exact integer filter can settle up to 63 counts below a rising target
-    motor_disp = motor_disp + ((pwm_on_time - motor_disp)>>6);
+    // Integer rounding can leave a small offset below a rising target.
+    motor_disp = motor_disp + ((pwm_on_time - motor_disp)>>MOTOR_FILTER_SHIFT);
 
     // Increment drawspeed controller
     throttle += 1 ;
@@ -304,31 +304,20 @@ static PT_THREAD (protothread_draw(struct pt *pt))
 //
 // THREAD 1: USER SERIAL INPUT
 //
-static void handle_serial_command(void) {
-    char command[8], extra;
-    float value;
-    volatile float *parameter = NULL;
-    snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer), "Invalid command/value.\r\n");
+static void handle_serial_angle(void) {
+    float angle;
+    char extra;
+    snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
+             "Enter an angle from 0 to 360 degrees.\r\n");
     if (memchr(pt_serial_in_buffer, '\0', sizeof(pt_serial_in_buffer)) == NULL) return;
-    if (sscanf(pt_serial_in_buffer, "%7s %f %c", command, &value, &extra) != 2) {
-        // A bare number still sets the PWM bias.
-        if (sscanf(pt_serial_in_buffer, "%f %c", &value, &extra) != 1) return;
-        strcpy(command, "bias");
-    }
-    if (!isfinite(value) || value < 0.0f || value > 1000000.0f) return;
-    if (strcmp(command, "kp") == 0) parameter = &Kp;
-    else if (strcmp(command, "ki") == 0) parameter = &Ki;
-    else if (strcmp(command, "kd") == 0) parameter = &Kd;
-    else if (strcmp(command, "target") == 0 && value <= 360) parameter = &desired_angle;
-    else if (strcmp(command, "bias") == 0 && value <= WRAPVAL && value == truncf(value))
-        parameter = &pwm_bias;
-    if (parameter == NULL) return;
+    if (sscanf(pt_serial_in_buffer, "%f %c", &angle, &extra) != 1 ||
+        !isfinite(angle) || angle < 0.0f || angle > 360.0f) return;
 
     uint32_t irq_state = save_and_disable_interrupts();
-    *parameter = value;
+    desired_angle = angle;
     restore_interrupts(irq_state);
-    snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer), "%s = %.4f%s\r\n",
-             command, value, (parameter == &Ki || parameter == &Kd) ? " (inactive: P-only control)" : "");
+    snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
+             "Target angle = %.2f degrees\r\n", angle);
 }
 
 static PT_THREAD (protothread_serial(struct pt *pt))
@@ -336,10 +325,10 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     PT_BEGIN(pt) ;
     while(1) {
         snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-                 "kp/ki/kd/target/bias <value>: ");
+                 "Target angle (0-360 degrees): ");
         serial_write ;
         serial_read ;
-        handle_serial_command();
+        handle_serial_angle();
         serial_write ;
     }
     PT_END(pt) ;
