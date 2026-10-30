@@ -50,12 +50,10 @@
 #include "mpu6050.h"
 #include "pt_cornell_rp2040_v1_4.h"
 
-// TUNING DEFAULTS: edit and rebuild, or set gains/target/bias over serial.
+// TUNING DEFAULTS: edit and rebuild, or set gains/target over serial.
 volatile float Kp = 50.0f;            // PWM counts per degree of angle error
-volatile float pwm_bias = 2000.0f;      // Baseline motor command (0..MOTOR_PWM_MAX)
 volatile float desired_angle = 90.0f; // Target: 0 stops motor; otherwise 0..180 degrees
-// Stored serial gains: unused while control is proportional-only.
-volatile float Ki = 0.0f, Kd = 0.0f;
+volatile float Ki = 2.0f, Kd = 1000.0f;
 #define ACCEL_FILTER_SHIFT 4        // Accel smoothing: 1/16 per sample
 #define MOTOR_FILTER_SHIFT 6        // VGA motor-command smoo   thing: 1/64 per sample
 // 150 MHz / (25 * 6000) = 1 kHz. PWM counter runs from 0 to WRAPVAL-1.
@@ -67,7 +65,7 @@ volatile float Ki = 0.0f, Kd = 0.0f;
 #define LEFT_EDGE 81
 #define PLOT_HEIGHT 150
 
-// x/y accelerometer components and rotation about sensor z
+// x/z accelerometer components and rotation about sensor y
 #define PI 3.14159265358979323846
 
 // Place the plots
@@ -82,7 +80,7 @@ fix15 acceleration[3], gyro[3];
 fix15 angle_history[PLOT_WIDTH] ;
 int motor_history[PLOT_WIDTH] ;
 // 15.16 fixed-point angle representation
-fix15 filtered_ax, filtered_ay ;
+fix15 filtered_ax, filtered_az ;
 fix15 accel_angle, gyro_angle_delta, complementary_angle ;
 // signed state persists between interrupts
 static int motor_disp = 0 ;
@@ -107,9 +105,9 @@ volatile int old_control ;
 
 static float calculate_control(float angle) {
     float target = desired_angle;
-    if (target <= 0.0f) return 0.0f; // Explicit motor-off command, regardless of bias.
+    if (target <= 0.0f) return 0.0f; // explicit motor-off command.
     float error = target - angle;
-    float output = pwm_bias + Kp * error;
+    float output = Kp * error;
     return fmaxf(0.0f, fminf(MOTOR_PWM_MAX, output));
 }
 
@@ -127,9 +125,6 @@ void drawAxes() {
     setCursor(410, 10); writeString(screentext);
     snprintf(screentext, sizeof(screentext), "Target: %.2f deg", desired_angle);
     setCursor(10, 28); writeString(screentext);
-    snprintf(screentext, sizeof(screentext), "Bias: %.0f PWM", pwm_bias);
-    setCursor(210, 28); writeString(screentext);
-    setCursor(410, 28); writeString("P-only: Ki/Kd inactive");
 
     // full-width checkpoint plots
     setCursor(82, 60) ; writeString("Beam angle (deg)") ;
@@ -168,14 +163,16 @@ void on_pwm_wrap() {
 
     // 3. low-pass the accelerometer measurements before calculating angle
     filtered_ax = filtered_ax + ((acceleration[0] - filtered_ax)>>ACCEL_FILTER_SHIFT);
-    filtered_ay = filtered_ay + ((acceleration[1] - filtered_ay)>>ACCEL_FILTER_SHIFT);
+    filtered_az = filtered_az + ((acceleration[2] - filtered_az)>>ACCEL_FILTER_SHIFT);
 
     // 4. estimates angle using complementary filter of accelerometer and gyro measurements
-    accel_angle = multfix15(float2fix15(atan2(-filtered_ax, filtered_ay) + PI), oneeightyoverpi);
-    gyro_angle_delta = multfix15(gyro[2], zeropt001) ;
-    complementary_angle = multfix15(complementary_angle - gyro_angle_delta, zeropt999) + multfix15(accel_angle, zeropt001);
+    accel_angle = multfix15(float2fix15(atan2(filtered_az, filtered_ax)), oneeightyoverpi);
+    gyro_angle_delta = gyro[1] / 1000;
+    complementary_angle += gyro_angle_delta;
+    complementary_angle += multfix15(
+        accel_angle - complementary_angle, float2fix15(0.01f));
 
-    // 5. proportional control at 1000 Hz: bias + Kp * angle error.
+    // 5. proportional control at 1000 Hz: Kp * angle error.
     int pwm_on_time = (int)calculate_control(fix2float15(complementary_angle));
 
     // 6. Sets a hardware PWM signal using output-compare unit to control the motor using the command
@@ -252,13 +249,12 @@ static PT_THREAD (protothread_draw(struct pt *pt))
 //
 static void handle_serial_command(void) {
     char extra;
-    float kp, ki, kd, target, bias;
+    float kp, ki, kd, target;
     snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-             "Invalid input. Use: kp ki kd target bias. Gains: 0..1000000; target: 0..180; bias: integer 0..%d.\r\n",
-             MOTOR_PWM_MAX);
+             "Invalid input. Use: kp ki kd target. Gains: 0..1000000; target: 0..180.\r\n");
     if (memchr(pt_serial_in_buffer, '\0', sizeof(pt_serial_in_buffer)) == NULL) return;
-    if (sscanf(pt_serial_in_buffer, "%f %f %f %f %f %c",
-               &kp, &ki, &kd, &target, &bias, &extra) != 5) {
+    if (sscanf(pt_serial_in_buffer, "%f %f %f %f %c",
+               &kp, &ki, &kd, &target, &extra) != 4) {
         if (sscanf(pt_serial_in_buffer, "%f %c", &target, &extra) != 1 || target != 0.0f) return;
         uint32_t irq_state = save_and_disable_interrupts();
         desired_angle = 0.0f;
@@ -269,19 +265,17 @@ static void handle_serial_command(void) {
     if (!isfinite(kp) || kp < 0.0f || kp > 1000000.0f ||
         !isfinite(ki) || ki < 0.0f || ki > 1000000.0f ||
         !isfinite(kd) || kd < 0.0f || kd > 1000000.0f ||
-        !isfinite(target) || target < 0.0f || target > 180.0f ||
-        !isfinite(bias) || bias < 0.0f || bias > MOTOR_PWM_MAX || bias != truncf(bias)) return;
+        !isfinite(target) || target < 0.0f || target > 180.0f) return;
 
     uint32_t irq_state = save_and_disable_interrupts();
     Kp = kp;
     Ki = ki;
     Kd = kd;
     desired_angle = target;
-    pwm_bias = bias;
     restore_interrupts(irq_state);
     snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-             "Kp=%.4f Ki=%.4f Kd=%.4f target=%.4f bias=%.0f (Ki/Kd inactive)%s\r\n",
-             kp, ki, kd, target, bias, target == 0.0f ? " (motor off)" : "");
+             "Kp=%.4f Ki=%.4f Kd=%.4f target=%.4f (Ki/Kd inactive)%s\r\n",
+             kp, ki, kd, target, target == 0.0f ? " (motor off)" : "");
 }
 
 static PT_THREAD (protothread_serial(struct pt *pt))
@@ -289,7 +283,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     PT_BEGIN(pt) ;
     while(1) {
         snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-                 "kp ki kd target bias (space-separated), or 0 = motor off: ");
+                 "kp ki kd target (space-separated), or 0 = motor off: ");
         serial_write ;
         serial_read ;
         handle_serial_command();
@@ -330,8 +324,8 @@ int main() {
 
     // initialize the complementary angle from the accelerometer
     filtered_ax = acceleration[0];
-    filtered_ay = acceleration[1];
-    accel_angle = multfix15(float2fix15(atan2(-filtered_ax, filtered_ay) + PI), oneeightyoverpi);
+    filtered_az = acceleration[2];
+    accel_angle = multfix15(float2fix15(atan2(filtered_az, filtered_ax)), oneeightyoverpi);
     complementary_angle = accel_angle;
 
     ////////////////////////////////////////////////////////////////////////
@@ -356,8 +350,8 @@ int main() {
     pwm_set_clkdiv(slice_num, CLKDIV) ;
 
     // This sets duty cycle
-    // start at the configured PWM bias.
-    old_control = (int)pwm_bias;
+    // start with zero PWM output.
+    old_control = 0;
     pwm_set_chan_level(slice_num, PWM_CHAN_A, old_control);
 
     // Start the channel
