@@ -9,12 +9,8 @@
  *   - GPIO 4 ---> PWM output
  * 
  * (from imu_demo.c) This demonstration utilizes the MPU6050.
- * It gathers raw accelerometer/gyro measurements, scales
- * them, and plots them to the VGA display. The top plot
- * shows gyro measurements, bottom plot shows accelerometer
- * measurements.
- * 
- * on the right: top = beam angle, bottom = slow-passed motor command signal
+ * the vga display shows two full-width plots:
+ * top = beam angle, bottom = low-passed motor command signal
  * 
  * HARDWARE CONNECTIONS
  *  - GPIO 16 ---> VGA Hsync
@@ -54,11 +50,11 @@
 #include "mpu6050.h"
 #include "pt_cornell_rp2040_v1_4.h"
 
-// TUNING PARAMETERS: edit these values, then rebuild and flash.
+// TUNING DEFAULTS: edit and rebuild, or set gains/target/bias over serial.
 volatile float Kp = 32.0f;            // PWM counts per degree of angle error
 volatile float pwm_bias = 0.0f;      // Baseline motor command (0..MOTOR_PWM_MAX)
 volatile float desired_angle = 0.0f; // Target: 0 stops motor; otherwise 0..180 degrees
-// Reserved gains: unused while control is proportional-only.
+// Stored serial gains: unused while control is proportional-only.
 volatile float Ki = 0.0f, Kd = 0.0f;
 #define ACCEL_FILTER_SHIFT 4        // Accel smoothing: 1/16 per sample
 #define MOTOR_FILTER_SHIFT 6        // VGA motor-command smoothing: 1/64 per sample
@@ -67,17 +63,9 @@ volatile float Ki = 0.0f, Kd = 0.0f;
 #define WRAPVAL 6000
 #define CLKDIV 25.0f
 
-// We will start drawing at column 81
-#define LEFT_EDGE 81 
-// place the checkpoint graphs in the right half of the display
-#define RIGHT_EDGE 401
-
-// Rescale the measurements for display
-#define OLD_RANGE 500.  // (+/- 250)
-#define NEW_RANGE 150.  // (looks nice on VGA)
-#define OLD_MIN -250. 
-#define OLD_MAX 250. 
-#define ACCEL_SCALE 120.0
+// both checkpoint plots span the screen from column 81 to 630
+#define LEFT_EDGE 81
+#define PLOT_HEIGHT 150
 
 // x/y accelerometer components and rotation about sensor z
 #define PI 3.14159265358979323846
@@ -85,19 +73,12 @@ volatile float Ki = 0.0f, Kd = 0.0f;
 // Place the plots
 #define TOP_PLOT_BOTTOM 230
 #define BOTTOM_PLOT_BOTTOM 430
-#define PLOT_WIDTH 230  // each column shows about 2.3 seconds at 100 saved samples/sec
+#define PLOT_WIDTH 550  // about 5.5 seconds at 100 saved samples/sec
 
 // Arrays in which raw measurements will be stored
 fix15 acceleration[3], gyro[3];
 
-// Arrays for circular display buffer
-fix15 ax[PLOT_WIDTH] ;
-fix15 ay[PLOT_WIDTH] ;
-fix15 az[PLOT_WIDTH] ;
-fix15 gx[PLOT_WIDTH] ;
-fix15 gy[PLOT_WIDTH] ;
-fix15 gz[PLOT_WIDTH] ;
-
+// circular display buffers for the two checkpoint signals
 fix15 angle_history[PLOT_WIDTH] ;
 int motor_history[PLOT_WIDTH] ;
 // 15.16 fixed-point angle representation
@@ -137,59 +118,40 @@ void drawAxes() {
     setTextSize(1) ;
     setTextColor(WHITE);
 
-    // titles for the original sensor plots and the checkpoint plots
-    setCursor(82, 60) ; writeString("Gyro (deg/s)") ;
-    setCursor(82, 260) ; writeString("Accel (g)") ;
-    setCursor(402, 60) ; writeString("Beam angle (deg)") ;
-    setCursor(402, 260) ; writeString("Filtered command (PWM)") ;
+    // Live settings header; refreshed along with the plots each frame.
+    snprintf(screentext, sizeof(screentext), "Kp: %.4f", Kp);
+    setCursor(10, 10); writeString(screentext);
+    snprintf(screentext, sizeof(screentext), "Ki: %.4f", Ki);
+    setCursor(210, 10); writeString(screentext);
+    snprintf(screentext, sizeof(screentext), "Kd: %.4f", Kd);
+    setCursor(410, 10); writeString(screentext);
+    snprintf(screentext, sizeof(screentext), "Target: %.2f deg", desired_angle);
+    setCursor(10, 28); writeString(screentext);
+    snprintf(screentext, sizeof(screentext), "Bias: %.0f PWM", pwm_bias);
+    setCursor(210, 28); writeString(screentext);
+    setCursor(410, 28); writeString("P-only: Ki/Kd inactive");
 
-    // Draw bottom plot
-    drawHLine(75, 430, 5, CYAN) ;
-    drawHLine(75, 355, 5, CYAN) ;
-    drawHLine(75, 280, 5, CYAN) ;
-    drawVLine(80, 280, 150, CYAN) ;
-    sprintf(screentext, "0") ;
-    setCursor(50, 350) ;
-    writeString(screentext) ;
-    sprintf(screentext, "+2") ;
-    setCursor(50, 280) ;
-    writeString(screentext) ;
-    sprintf(screentext, "-2") ;
-    setCursor(50, 425) ;
-    writeString(screentext) ;
+    // full-width checkpoint plots
+    setCursor(82, 60) ; writeString("Beam angle (deg)") ;
+    setCursor(82, 260) ; writeString("Filtered command (PWM)") ;
 
-    // Draw top plot
+    // top plot: beam angle, 0..180 degrees
     drawHLine(75, 230, 5, CYAN) ;
     drawHLine(75, 155, 5, CYAN) ;
     drawHLine(75, 80, 5, CYAN) ;
-    drawVLine(80, 80, 150, CYAN) ;
-    sprintf(screentext, "0") ;
-    setCursor(50, 150) ;
-    writeString(screentext) ;
-    sprintf(screentext, "+250") ;
-    setCursor(45, 75) ;
-    writeString(screentext) ;
-    sprintf(screentext, "-250") ;
-    setCursor(45, 225) ;
-    writeString(screentext) ;
+    drawVLine(80, 80, PLOT_HEIGHT, CYAN) ;
+    setCursor(45, 225) ; writeString("0") ;
+    setCursor(45, 150) ; writeString("90") ;
+    setCursor(45, 75) ; writeString("180") ;
 
-    // top-right plot: complementary angle using 0..360 convention
-    drawHLine(395, 230, 5, CYAN) ;
-    drawHLine(395, 155, 5, CYAN) ;
-    drawHLine(395, 80, 5, CYAN) ;
-    drawVLine(400, 80, 150, CYAN) ;
-    setCursor(365, 225) ; writeString("0") ;
-    setCursor(365, 150) ; writeString("180") ;
-    setCursor(365, 75) ; writeString("360") ;
-
-    // bottom-right plot: software-filtered motor command, 0..6000 counts
-    drawHLine(395, 430, 5, CYAN) ;
-    drawHLine(395, 355, 5, CYAN) ;
-    drawHLine(395, 280, 5, CYAN) ;
-    drawVLine(400, 280, 150, CYAN) ;
-    setCursor(365, 425) ; writeString("0") ;
-    setCursor(365, 350) ; writeString("3000") ;
-    setCursor(365, 275) ; writeString("6000") ;
+    // bottom plot: low-passed motor command, 0..4000 counts
+    drawHLine(75, 430, 5, CYAN) ;
+    drawHLine(75, 355, 5, CYAN) ;
+    drawHLine(75, 280, 5, CYAN) ;
+    drawVLine(80, 280, PLOT_HEIGHT, CYAN) ;
+    setCursor(45, 425) ; writeString("0") ;
+    setCursor(45, 350) ; writeString("2000") ;
+    setCursor(45, 275) ; writeString("4000") ;
 }
 
 //
@@ -234,16 +196,6 @@ void on_pwm_wrap() {
         // Zero drawspeed controller
         throttle = 0 ;
 
-        // Replace oldest data in accel arrays with new sample
-        ax[head] = acceleration[0] ;
-        ay[head] = acceleration[1] ;
-        az[head] = acceleration[2] ;
-
-        // Replace oldest data in gyro arrays with new sample
-        gx[head] = gyro[0] ;
-        gy[head] = gyro[1] ;
-        gz[head] = gyro[2] ;
-
         // replace oldest data with the measured angle and filtered motor command
         angle_history[head] = complementary_angle ;
         motor_history[head] = motor_disp ;
@@ -280,23 +232,14 @@ static PT_THREAD (protothread_draw(struct pt *pt))
 
         start = head ;
         for (i = 0; i < PLOT_WIDTH; i++) {
+            // keep out-of-range angle samples from drawing over the header
+            float angle = fix2float15(angle_history[start]);
+            if (angle >= 0.0f && angle <= 180.0f) {
+                drawPixel(LEFT_EDGE + i, (TOP_PLOT_BOTTOM -
+                    (int)(PLOT_HEIGHT * angle / 180.0f)), WHITE) ;
+            }
             drawPixel(LEFT_EDGE + i, (BOTTOM_PLOT_BOTTOM -
-                (int)(NEW_RANGE*((float)((fix2float15(ax[start])*ACCEL_SCALE)-OLD_MIN)/OLD_RANGE))), WHITE) ;
-            drawPixel(LEFT_EDGE + i, (BOTTOM_PLOT_BOTTOM -
-                (int)(NEW_RANGE*((float)((fix2float15(ay[start])*ACCEL_SCALE)-OLD_MIN)/OLD_RANGE))), RED) ;
-            drawPixel(LEFT_EDGE + i, (BOTTOM_PLOT_BOTTOM -
-                (int)(NEW_RANGE*((float)((fix2float15(az[start])*ACCEL_SCALE)-OLD_MIN)/OLD_RANGE))), GREEN) ;
-            drawPixel(LEFT_EDGE + i, (TOP_PLOT_BOTTOM -
-                (int)(NEW_RANGE*((float)((fix2float15(gx[start]))-OLD_MIN)/OLD_RANGE))), WHITE) ;
-            drawPixel(LEFT_EDGE + i, (TOP_PLOT_BOTTOM -
-                (int)(NEW_RANGE*((float)((fix2float15(gy[start]))-OLD_MIN)/OLD_RANGE))), RED) ;
-            drawPixel(LEFT_EDGE + i, (TOP_PLOT_BOTTOM -
-                (int)(NEW_RANGE*((float)((fix2float15(gz[start]))-OLD_MIN)/OLD_RANGE))), GREEN) ;
-            // draw the checkpoint signals beside the original sensor traces
-            drawPixel(RIGHT_EDGE + i, (TOP_PLOT_BOTTOM -
-                (int)(NEW_RANGE * fix2float15(angle_history[start]) / 360.0f)), WHITE) ;
-            drawPixel(RIGHT_EDGE + i, (BOTTOM_PLOT_BOTTOM -
-                (int)(NEW_RANGE * (float)motor_history[start] / WRAPVAL)), GREEN) ;
+                (int)(PLOT_HEIGHT * (float)motor_history[start] / MOTOR_PWM_MAX)), GREEN) ;
             start = ((start+1)==PLOT_WIDTH) ? 0 : (start+1) ;
         }
     }
@@ -307,21 +250,35 @@ static PT_THREAD (protothread_draw(struct pt *pt))
 //
 // THREAD 1: USER SERIAL INPUT
 //
-static void handle_serial_angle(void) {
-    float angle;
-    char extra;
+static void handle_serial_command(void) {
+    char command[8], extra;
+    float value;
+    volatile float *parameter = NULL;
     snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-             "Enter 0 to stop, or an angle up to 180 degrees.\r\n");
+             "Invalid input. Gains: 0..1000000; target: 0..180; bias: integer 0..%d.\r\n",
+             MOTOR_PWM_MAX);
     if (memchr(pt_serial_in_buffer, '\0', sizeof(pt_serial_in_buffer)) == NULL) return;
-    if (sscanf(pt_serial_in_buffer, "%f %c", &angle, &extra) != 1 ||
-        !isfinite(angle) || angle < 0.0f || angle > 180.0f) return;
+    if (sscanf(pt_serial_in_buffer, "%7s %f %c", command, &value, &extra) != 2) {
+        // Keep bare angles working: 0 stops the motor.
+        if (sscanf(pt_serial_in_buffer, "%f %c", &value, &extra) != 1) return;
+        strcpy(command, "target");
+    }
+    if (!isfinite(value) || value < 0.0f || value > 1000000.0f) return;
+    if (strcmp(command, "kp") == 0) parameter = &Kp;
+    else if (strcmp(command, "ki") == 0) parameter = &Ki;
+    else if (strcmp(command, "kd") == 0) parameter = &Kd;
+    else if (strcmp(command, "target") == 0 && value <= 180) parameter = &desired_angle;
+    else if (strcmp(command, "bias") == 0 && value <= MOTOR_PWM_MAX && value == truncf(value))
+        parameter = &pwm_bias;
+    if (parameter == NULL) return;
 
     uint32_t irq_state = save_and_disable_interrupts();
-    desired_angle = angle;
+    *parameter = value;
     restore_interrupts(irq_state);
+    const char *note = (parameter == &Ki || parameter == &Kd) ? " (stored; inactive in P-only control)" :
+                      (parameter == &desired_angle && value == 0.0f) ? " (motor off)" : "";
     snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-             "Target angle = %.2f degrees%s\r\n", angle,
-             angle == 0.0f ? " (motor off)" : "");
+             "%s = %.4f%s\r\n", command, value, note);
 }
 
 static PT_THREAD (protothread_serial(struct pt *pt))
@@ -329,10 +286,10 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     PT_BEGIN(pt) ;
     while(1) {
         snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-                 "Target angle (0-180 degrees; 0 = motor off): ");
+                 "kp/ki/kd/target/bias <value>, or angle (0 = motor off): ");
         serial_write ;
         serial_read ;
-        handle_serial_angle();
+        handle_serial_command();
         serial_write ;
     }
     PT_END(pt) ;
