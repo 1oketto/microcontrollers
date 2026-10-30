@@ -51,13 +51,13 @@
 #include "pt_cornell_rp2040_v1_4.h"
 
 // TUNING DEFAULTS: edit and rebuild, or set gains/target/bias over serial.
-volatile float Kp = 32.0f;            // PWM counts per degree of angle error
-volatile float pwm_bias = 0.0f;      // Baseline motor command (0..MOTOR_PWM_MAX)
-volatile float desired_angle = 0.0f; // Target: 0 stops motor; otherwise 0..180 degrees
+volatile float Kp = 50.0f;            // PWM counts per degree of angle error
+volatile float pwm_bias = 2000.0f;      // Baseline motor command (0..MOTOR_PWM_MAX)
+volatile float desired_angle = 90.0f; // Target: 0 stops motor; otherwise 0..180 degrees
 // Stored serial gains: unused while control is proportional-only.
 volatile float Ki = 0.0f, Kd = 0.0f;
 #define ACCEL_FILTER_SHIFT 4        // Accel smoothing: 1/16 per sample
-#define MOTOR_FILTER_SHIFT 6        // VGA motor-command smoothing: 1/64 per sample
+#define MOTOR_FILTER_SHIFT 6        // VGA motor-command smoo   thing: 1/64 per sample
 // 150 MHz / (25 * 6000) = 1 kHz. PWM counter runs from 0 to WRAPVAL-1.
 #define MOTOR_PWM_MAX 4000          // Motor command limit; PWM period stays 6000
 #define WRAPVAL 6000
@@ -251,34 +251,37 @@ static PT_THREAD (protothread_draw(struct pt *pt))
 // THREAD 1: USER SERIAL INPUT
 //
 static void handle_serial_command(void) {
-    char command[8], extra;
-    float value;
-    volatile float *parameter = NULL;
+    char extra;
+    float kp, ki, kd, target, bias;
     snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-             "Invalid input. Gains: 0..1000000; target: 0..180; bias: integer 0..%d.\r\n",
+             "Invalid input. Use: kp ki kd target bias. Gains: 0..1000000; target: 0..180; bias: integer 0..%d.\r\n",
              MOTOR_PWM_MAX);
     if (memchr(pt_serial_in_buffer, '\0', sizeof(pt_serial_in_buffer)) == NULL) return;
-    if (sscanf(pt_serial_in_buffer, "%7s %f %c", command, &value, &extra) != 2) {
-        // Keep bare angles working: 0 stops the motor.
-        if (sscanf(pt_serial_in_buffer, "%f %c", &value, &extra) != 1) return;
-        strcpy(command, "target");
+    if (sscanf(pt_serial_in_buffer, "%f %f %f %f %f %c",
+               &kp, &ki, &kd, &target, &bias, &extra) != 5) {
+        if (sscanf(pt_serial_in_buffer, "%f %c", &target, &extra) != 1 || target != 0.0f) return;
+        uint32_t irq_state = save_and_disable_interrupts();
+        desired_angle = 0.0f;
+        restore_interrupts(irq_state);
+        snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer), "Motor off\r\n");
+        return;
     }
-    if (!isfinite(value) || value < 0.0f || value > 1000000.0f) return;
-    if (strcmp(command, "kp") == 0) parameter = &Kp;
-    else if (strcmp(command, "ki") == 0) parameter = &Ki;
-    else if (strcmp(command, "kd") == 0) parameter = &Kd;
-    else if (strcmp(command, "target") == 0 && value <= 180) parameter = &desired_angle;
-    else if (strcmp(command, "bias") == 0 && value <= MOTOR_PWM_MAX && value == truncf(value))
-        parameter = &pwm_bias;
-    if (parameter == NULL) return;
+    if (!isfinite(kp) || kp < 0.0f || kp > 1000000.0f ||
+        !isfinite(ki) || ki < 0.0f || ki > 1000000.0f ||
+        !isfinite(kd) || kd < 0.0f || kd > 1000000.0f ||
+        !isfinite(target) || target < 0.0f || target > 180.0f ||
+        !isfinite(bias) || bias < 0.0f || bias > MOTOR_PWM_MAX || bias != truncf(bias)) return;
 
     uint32_t irq_state = save_and_disable_interrupts();
-    *parameter = value;
+    Kp = kp;
+    Ki = ki;
+    Kd = kd;
+    desired_angle = target;
+    pwm_bias = bias;
     restore_interrupts(irq_state);
-    const char *note = (parameter == &Ki || parameter == &Kd) ? " (stored; inactive in P-only control)" :
-                      (parameter == &desired_angle && value == 0.0f) ? " (motor off)" : "";
     snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-             "%s = %.4f%s\r\n", command, value, note);
+             "Kp=%.4f Ki=%.4f Kd=%.4f target=%.4f bias=%.0f (Ki/Kd inactive)%s\r\n",
+             kp, ki, kd, target, bias, target == 0.0f ? " (motor off)" : "");
 }
 
 static PT_THREAD (protothread_serial(struct pt *pt))
@@ -286,7 +289,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     PT_BEGIN(pt) ;
     while(1) {
         snprintf(pt_serial_out_buffer, sizeof(pt_serial_out_buffer),
-                 "kp/ki/kd/target/bias <value>, or angle (0 = motor off): ");
+                 "kp ki kd target bias (space-separated), or 0 = motor off: ");
         serial_write ;
         serial_read ;
         handle_serial_command();
@@ -353,8 +356,9 @@ int main() {
     pwm_set_clkdiv(slice_num, CLKDIV) ;
 
     // This sets duty cycle
-    // match the initially zero PWM bias and motor_disp values.
-    pwm_set_chan_level(slice_num, PWM_CHAN_A, 0);
+    // start at the configured PWM bias.
+    old_control = (int)pwm_bias;
+    pwm_set_chan_level(slice_num, PWM_CHAN_A, old_control);
 
     // Start the channel
     pwm_set_mask_enabled((1u << slice_num));
